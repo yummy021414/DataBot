@@ -299,7 +299,7 @@ export class TelegramBot {
     this.bot.action('confirm_broadcast', this.handleConfirmBroadcast.bind(this));
     this.bot.action('cancel_broadcast', this.handleCancelBroadcast.bind(this));
     this.bot.action('start_search', this.handleStartSearch.bind(this));
-    this.bot.action('start_upload', this.handleStartUpload.bind(this));
+    this.bot.action('start_upload', this.withStrictAuthorization(this.handleStartUpload.bind(this)));
     this.bot.action('start_publish', this.handleStartPublish.bind(this));
     this.bot.action('start_keywords', this.handleStartKeywords.bind(this));
     this.bot.action('start_help', this.handleStartHelp.bind(this));
@@ -483,7 +483,6 @@ export class TelegramBot {
             welcomeMessage += `👤 用户功能\n\n`;
             welcomeMessage += `📋 可用功能：\n`;
             welcomeMessage += `• 🔍 搜索资料 - 快速查找资料\n`;
-            welcomeMessage += `• 📁 上传资料 - 批量上传照片、视频\n`;
             welcomeMessage += `• 📄 查看资料 - 浏览和管理资料\n`;
             welcomeMessage += `• 🖼️ 网页相册 - 制作网页相册链接\n`;
             welcomeMessage += `• 💬 联系管理员 - 随时联系管理员\n\n`;
@@ -529,7 +528,6 @@ export class TelegramBot {
             // 普通用户：第一行 - 核心功能
       inlineKeyboard.push([
                 Markup.button.callback('🔍 搜索资料', 'start_search'),
-                Markup.button.callback('📁 上传资料', 'start_upload'),
                 Markup.button.callback('📄 查看资料', 'start_keywords')
       ]);
             // 第二行 - 其他功能
@@ -588,8 +586,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
         if (!userId)
             return;
-    // 会员制度已取消，上传功能对所有用户开放
-    // 设置用户为上传模式
+    // 设置管理员为上传模式
     if (this.isAdmin(userId)) userAccountCommands.silentCleanup(userId);
         const session = {
       userId,
@@ -827,9 +824,8 @@ export class TelegramBot {
         }
         else {
       helpMessage += `👤 用户使用指南\n\n`;
-      helpMessage += `🎯 功能已全开，可直接使用\n`;
+      helpMessage += `🎯 可直接使用以下功能\n`;
       helpMessage += `• 🔍 搜索资料\n`;
-      helpMessage += `• 📁 上传资料\n`;
       helpMessage += `• 🖼️ 网页相册（单次最多20组，3天后自动清除）\n`;
       helpMessage += `• 📚 浏览资料\n`;
       helpMessage += `• 💬 联系管理员获取帮助\n\n`;
@@ -842,10 +838,12 @@ export class TelegramBot {
       Markup.button.callback('📚 资料浏览', 'help_keywords'),
       Markup.button.callback('💬 联系客服', 'help_chat')
     ]);
-    helpKeyboard.push([
-      Markup.button.callback('📁 上传管理', 'help_upload'),
-      Markup.button.callback('🚀 内容发布', 'help_publish')
-    ]);
+    if (isAdmin) {
+      helpKeyboard.push([
+        Markup.button.callback('📁 上传管理', 'help_upload'),
+        Markup.button.callback('🚀 内容发布', 'help_publish')
+      ]);
+    }
     // 第二行：管理员功能帮助（仅管理员）
     if (isAdmin) {
       helpKeyboard.push([
@@ -865,7 +863,7 @@ export class TelegramBot {
       helpMessage += `📋 包含数据管理、用户管理、权限控制等\n\n`;
         }
         else {
-      helpMessage += `✅ **功能已全开** - 可使用搜索、上传、查看资料、网页相册等\n\n`;
+      helpMessage += `✅ 可使用搜索、查看资料、网页相册等功能\n\n`;
     }
     helpMessage += `点击下方按钮获取详细使用指南：`;
     // 移除冗长的功能描述列表，让按钮标签更直观
@@ -2260,9 +2258,9 @@ export class TelegramBot {
       ]).resize();
         }
         else {
-      // 👤 普通用户键盘（会员制度已取消，功能全开）
+      // 👤 普通用户键盘
       return Markup.keyboard([
-                ['🖼️ 网页相册', BUTTONS.UPLOAD_DATA, BUTTONS.VIEW_DATA],
+                ['🖼️ 网页相册', BUTTONS.VIEW_DATA],
                 [BUTTONS.CHAT_WITH_ADMIN]
       ]).resize();
     }
