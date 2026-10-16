@@ -46,7 +46,7 @@
 
 本地验证：`npm run build` 后运行 `node scripts/reply-group-check.cjs`，使用临时数据库和模拟 Telegram 消息。
 
-“查看资料”中，水印管理下方新增 `🕘 最近搜索`。按个人最近 30 天的搜索次数排序，同次数按最后搜索时间排序；关键词使用三列分页按钮，点击即可查看资料。文字搜索和点击关键词均计数，未找到的关键词不计数。记录从更新后开始累计，重启保留；已删除或无权访问的关键词不显示。验证脚本：`node scripts/recent-search-check.cjs`。
+“查看资料”中，水印管理下方新增 `🕘 最近搜索`。按个人最近 30 天的搜索次数排序，同次数按最后搜索时间排序；关键词使用三列分页按钮，点击即可查看资料。文字搜索和点击关键词均计数，未找到的关键词不计数。历史记录可从日志补录，新搜索实时累计，重启保留；已删除或无权访问的关键词不显示。验证脚本：`node scripts/recent-search-check.cjs`。
 
 ---
 
@@ -141,3 +141,5 @@ data/         运行数据（本地生成，不纳入 Git）
 ## 开源协议
 
 MIT License · 欢迎 Fork 与 Issue
+
+历史搜索补录：停止机器人并备份数据库后，使用 `node scripts/import-search-history.cjs --db data/bot.json --log data/bot.log --before <实时统计首次启用的ISO时间>` 预览，再添加 `--apply --bot-stopped` 写入。脚本仅导入截止时间之前、最近30天内的记录，通过用户ID或唯一用户名识别账号，不按昵称猜测。补录标记防止重复执行，保留已有实时统计。日志时间按 Asia/Shanghai 解析。

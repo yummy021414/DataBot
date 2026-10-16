@@ -153,7 +153,7 @@ export class SearchHandler {
         const voiceCount = mediaItems.filter(item => item.file_type === 'voice').length;
 
         console.log(
-          `🔍 [搜索] ${userDisplay} -> 关键词: "${kw}"` +
+          `🔍 [搜索] ${userDisplay} (ID: ${userId}) -> 关键词: "${kw}"` +
           (keywords.length > 1 ? ` (${ki + 1}/${keywords.length} 来自「${keyword}」)` : '') +
           ` | 结果: 📷${photoCount} 🎥${videoCount} 📄${documentCount} 🎵${audioCount} 🎤${voiceCount} (共${mediaItems.length}个)`
         );

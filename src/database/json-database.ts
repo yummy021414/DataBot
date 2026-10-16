@@ -21,6 +21,7 @@ interface ChatMessageRecord {
 }
 
 interface DatabaseData {
+  searchHistoryImports?: string[];
   searchUsage?: Array<{ userId: number; keyword: string; day: string; count: number; lastAt: number }>;
   media: MediaItem[];
   userPermissions: UserPermission[];
@@ -75,6 +76,7 @@ export class JsonDatabase {
         this.data = {
           media: loadedData.media || [],
           searchUsage: Array.isArray(loadedData.searchUsage) ? loadedData.searchUsage : [],
+          searchHistoryImports: Array.isArray(loadedData.searchHistoryImports) ? loadedData.searchHistoryImports : [],
           searchReplyGroups: this.normalizeObjectMap(loadedData.searchReplyGroups),
           userPermissions: loadedData.userPermissions || [],
           userSessions: this.normalizeObjectMap(loadedData.userSessions),
@@ -181,6 +183,7 @@ export class JsonDatabase {
     const payload = {
       media: this.data.media || [],
       searchUsage: this.data.searchUsage || [],
+      searchHistoryImports: this.data.searchHistoryImports || [],
       searchReplyGroups: this.data.searchReplyGroups || {},
       userPermissions: this.data.userPermissions || [],
       userSessions: this.uploadSessionSnapshots(),

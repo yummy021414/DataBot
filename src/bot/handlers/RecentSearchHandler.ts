@@ -45,7 +45,7 @@ export class RecentSearchHandler {
     buttons.push([Markup.button.callback('⬅️ 返回查看资料', 'start_keywords')]);
     const text = `🕘 最近搜索（第 ${page + 1}/${totalPages} 页）\n\n` +
       '统计你最近 30 天的搜索，次数多的排前面，同次数按最近搜索时间排序。\n\n' +
-      (entries.length ? `共 ${entries.length} 个关键词，点击即可查看资料。` : '暂无记录。搜索关键词或点击资料关键词后会自动记录；历史搜索不补录。');
+      (entries.length ? `共 ${entries.length} 个关键词，点击即可查看资料。` : '近 30 天暂无可查看的搜索记录。搜索关键词或点击资料关键词后会自动记录。');
     if (ctx.callbackQuery) {
       try { await ctx.editMessageText(text, Markup.inlineKeyboard(buttons)); }
       catch (error: any) { if (!String(error.description || error.message).includes('message is not modified')) throw error; }
