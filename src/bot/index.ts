@@ -6,6 +6,7 @@ import { database } from '../database';
 import { SearchHandler } from './handlers/SearchHandler';
 import { ReplaceGroupHandler } from './handlers/ReplaceGroupHandler';
 import { RecentSearchHandler } from './handlers/RecentSearchHandler';
+import { publicationQueue } from '../services/publicationQueue';
 import { UploadHandler } from './handlers/UploadHandler';
 import { PublishHandler } from './handlers/PublishHandler';
 import { scheduledPublish } from '../services/scheduledPublish';
@@ -199,6 +200,23 @@ export class TelegramBot {
     this.bot.command('setforwarddelay', this.withAuthorization(this.handleSetForwardDelay.bind(this)));
     this.bot.command('showforwarddelay', this.withAuthorization(this.handleShowForwardDelay.bind(this)));
     this.bot.command('vaultstatus', this.withStrictAuthorization(this.handleVaultStatus.bind(this)));
+    this.bot.command('publish_resume', this.withStrictAuthorization(async ctx => {
+      const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+      const channel = text.trim().split(/\s+/)[1];
+      if (!channel) { await ctx.reply('请先核对频道最后一组，再发送 /publish_resume 频道ID。恢复只解除暂停，不会重发旧任务。'); return; }
+      if (!isSuperAdmin(ctx.from!.id)) {
+        const allowed = hasAdminChannelMap(ctx.from!.id) ? getAdminChannelIds(ctx.from!.id) : await database.getManagedChannels();
+        const target = await ctx.telegram.getChat(channel);
+        const ids = await Promise.all(allowed.map(async id => {
+          try { return String((await ctx.telegram.getChat(id)).id); } catch { return id; }
+        }));
+        if (!ids.includes(String(target.id))) { await ctx.reply('没有管理该频道的权限。'); return; }
+      }
+      try {
+        const restored = await publicationQueue.resume(ctx.telegram, channel);
+        await ctx.reply(restored ? '✅ 已解除频道暂停。请只补发尚未完成的资料，旧任务不会自动重发。' : '该频道当前没有因发布异常而暂停。');
+      } catch (error: any) { await ctx.reply(`❌ ${error.message}`); }
+    }));
     this.bot.command('watermark', this.withStrictAuthorization(async (ctx) => {
       await WatermarkHandler.handleMenu(ctx, database);
     }));

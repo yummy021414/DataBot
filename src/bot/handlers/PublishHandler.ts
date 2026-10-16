@@ -4,6 +4,7 @@ import { UserSession } from '../../types';
 import { config, isAdminUser, isSuperAdmin } from '../../config';
 import { recordPublishEvent } from '../../services/publishAudit';
 import { SearchHandler } from './SearchHandler';
+import { publicationQueue, publicationBatches, publicationChunks } from '../../services/publicationQueue';
 import { scheduledPublish, parsePublishTime, publishTimeLabel } from '../../services/scheduledPublish';
 
 export class PublishHandler {
@@ -173,6 +174,9 @@ export class PublishHandler {
     userId: number,
     scopeUserId: number | undefined
   ): Promise<void> {
+    const channelIds = this.getSelectedChannels(session);
+    const pausedChannels = new Set<string>();
+    const failureReasons = new Map<string, string>();
     try {
       console.log(`📢 [发布] 开始解析关键词库…`);
       const knownKeywords = await db.getAllKeywords(scopeUserId);
@@ -191,7 +195,6 @@ export class PublishHandler {
           : '🔍 正在搜索并发布...'
       );
 
-      const channelIds = this.getSelectedChannels(session);
       if (channelIds.length === 0) {
         await this.safeReply(ctx, '❌ 请先选择至少一个目标群或频道。');
         return;
@@ -210,25 +213,13 @@ export class PublishHandler {
           continue;
         }
 
-        const batchEstimate = Object.keys(
-          mediaItems.reduce((acc: any, item: any) => {
-            const b = item.batchId || `legacy_${item.id}`;
-            acc[b] = true;
-            return acc;
-          }, {})
-        ).length;
+        const batchEstimate = publicationBatches(mediaItems).length;
 
         console.log(`📢 [发布] ${ki + 1}/${keywords.length} 关键词="${kw}" → ${mediaItems.length} 文件 / 约 ${batchEstimate} 组`);
-        await this.safeReply(
-          ctx,
-          `⏳ 正在发布「${kw}」：${mediaItems.length} 个文件 / 约 ${batchEstimate} 组\n` +
-          `（组与组之间有间隔，资料多时请耐心等，完成后会提示）`
-        );
-
         const successes: Array<{ channelId: string; count: number }> = [];
         const failedChannels: string[] = [];
-        for (let channelIndex = 0; channelIndex < channelIds.length; channelIndex++) {
-          const channelId = channelIds[channelIndex];
+        await Promise.all(channelIds.map(async channelId => {
+          if (pausedChannels.has(channelId)) { failedChannels.push(channelId); return; }
           try {
             const publishedCount = await this.publishToChannel(bot, channelId, mediaItems, kw, async (done, total) => {
               if (done === total || done % 5 === 0) {
@@ -245,12 +236,11 @@ export class PublishHandler {
             });
           } catch (error: any) {
             failedChannels.push(channelId);
+            pausedChannels.add(channelId);
+            failureReasons.set(channelId, String(error?.message || error).slice(0, 500));
             console.error(`📢 [发布] "${kw}" 发往 ${channelId} 失败:`, error?.message || error);
           }
-          if (channelIndex < channelIds.length - 1) {
-            await new Promise(resolve => setTimeout(resolve, 1200));
-          }
-        }
+        }));
 
         if (successes.length === 0) {
           results.push({ kw, count: 0, ok: false, missing: false, failedChannels });
@@ -260,16 +250,13 @@ export class PublishHandler {
 
         // 资料条目仍保留一个主发布频道，兼容现有统计与筛选；审计日志会记录全部目标。
         for (const item of mediaItems) {
-          await db.updateMediaPublished(item.id, successes[0].channelId);
+          await db.updateMediaPublished(item.id, channelIds.find(id => successes.some(s => s.channelId === id))!);
         }
 
         const publishedCount = successes.reduce((sum, item) => sum + item.count, 0);
         results.push({ kw, count: publishedCount, ok: true, missing: false, failedChannels });
         totalPublished += publishedCount;
 
-        if (ki < keywords.length - 1) {
-          await new Promise(r => setTimeout(r, 2500));
-        }
       }
 
       if (userSessions.get(userId) === session) {
@@ -301,12 +288,13 @@ export class PublishHandler {
       }
       const partialFailures = results.filter(result => result.failedChannels.length > 0);
       if (partialFailures.length > 0) {
-        summary += `\n部分目标发送失败：\n` + partialFailures
+        summary += `\n部分目标未完成（请核对频道最后一组，勿重复发送整批）：\n` + partialFailures
           .map(result => `• ${result.kw}：${result.failedChannels.join('、')}`)
           .join('\n') + '\n';
       }
 
       summary +=
+        (failureReasons.size ? '\n未完成原因：\n' + [...failureReasons].map(([id, reason]) => `${id}：${reason}`).join('\n') + '\n' : '') +
         `\n🔄 发布模式仍然激活\n` +
         `💡 可继续输入多个关键词（如：优米樊樊 或 优米 樊樊），将按顺序连发。`;
 
@@ -414,188 +402,19 @@ export class PublishHandler {
     keyword: string,
     onBatchProgress?: (done: number, total: number) => void | Promise<void>
   ): Promise<number> {
-    let publishedCount = 0;
-
-    try {
-      console.log(`📢 开始发布 ${mediaItems.length} 个媒体到频道 ${channelId} | 关键词="${keyword}"`);
-      
-      // 🚀 核心优化：按批次分组，并按媒体列表出现顺序发布，避免乱序
-      const batches: { [key: string]: any[] } = {};
-      const batchOrder: string[] = [];
-      mediaItems.forEach((item: any) => {
-        const bId = item.batchId || `legacy_${item.id}`;
-        if (!batches[bId]) {
-          batches[bId] = [];
-          batchOrder.push(bId);
+    const batches = publicationBatches(mediaItems);
+    return publicationQueue.run(bot.telegram, channelId, async send => {
+      console.log('📢 开始发布 ' + mediaItems.length + ' 个媒体到频道 ' + channelId + ' | 关键词="' + keyword + '"');
+      let count = 0;
+      for (let i = 0; i < batches.length; i++) {
+        for (const chunk of publicationChunks(batches[i])) {
+          await send(chunk);
+          count += chunk.length;
         }
-        batches[bId].push(item);
-      });
-
-      for (let i = 0; i < batchOrder.length; i++) {
-        const batchItems = batches[batchOrder[i]];
-        
-        // 按类型分组当前批次的媒体
-        const groupedMedia = this.groupMediaByType(batchItems);
-      
-        // 发送当前批次的所有媒体（await 串行）
-        await this.sendMediaGroups(bot, channelId, groupedMedia, batchItems);
-
-        if (onBatchProgress) {
-          try { await onBatchProgress(i + 1, batchOrder.length); } catch {}
-        }
-        
-        // 批次间延迟，防止顺序错乱 / 限流
-        if (i < batchOrder.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
+        if (onBatchProgress) await onBatchProgress(i + 1, batches.length);
       }
-      
-      publishedCount = mediaItems.length;
-      return publishedCount;
-    } catch (error) {
-      console.error('发布到频道错误:', error);
-      throw error;
-    }
-  }
-
-  private static async sendMediaGroups(
-    bot: Telegraf, 
-    channelId: string, 
-    groupedMedia: { [key: string]: any[] }, 
-    allMedia: any[]
-  ): Promise<void> {
-    if (allMedia.length === 0) return;
-
-    // 找到主要文字说明（优先选择有文字的媒体）
-    const mainCaptionMedia = allMedia.find(item => item.caption && item.caption.trim().length > 0);
-    const mainCaption = (mainCaptionMedia && mainCaptionMedia.caption) ? mainCaptionMedia.caption : '';
-
-    // 按类型发送媒体组
-    const photoItems = allMedia.filter(item => item.file_type === 'photo');
-    const videoItems = allMedia.filter(item => item.file_type === 'video');
-    const animationItems = allMedia.filter(item => item.file_type === 'animation');
-    const documentItems = allMedia.filter(item => item.file_type === 'document');
-    const audioItems = allMedia.filter(item => item.file_type === 'audio');
-    const voiceItems = allMedia.filter(item => item.file_type === 'voice');
-    const videoNoteItems = allMedia.filter(item => item.file_type === 'video_note');
-      
-    // 🚀 优化策略：Telegram 限制 sendMediaGroup 只能混合 photo 和 video (animation 也是 video)
-    // Document 和 Audio 必须成组或单独发送，不能与 Photo/Video 混合
-    
-    // 1. 发送照片、视频、动画组合
-    const visualMedia = allMedia.filter(item => ['photo', 'video', 'animation'].includes(item.file_type));
-    if (visualMedia.length > 0) {
-      await this.sendCompatibleMediaGroup(bot, channelId, visualMedia, mainCaption);
-    }
-
-    // 2. 发送文档组合
-    if (documentItems.length > 0) {
-      await this.sendCompatibleMediaGroup(bot, channelId, documentItems, visualMedia.length === 0 ? mainCaption : '');
-    }
-
-    // 3. 发送音频组合
-    if (audioItems.length > 0) {
-      await this.sendCompatibleMediaGroup(bot, channelId, audioItems, (visualMedia.length === 0 && documentItems.length === 0) ? mainCaption : '');
-    }
-
-    // 4. 发送语音消息（不能放在媒体组中）
-    for (const item of voiceItems) {
-      try {
-        await this.sendSingleMediaToChannel(bot, channelId, item);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error('发送语音消息错误:', error);
-      }
-    }
-
-    // 5. 发送视频动态（不能放在媒体组中）
-    for (const item of videoNoteItems) {
-      try {
-        await this.sendSingleMediaToChannel(bot, channelId, item);
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        console.error('发送视频动态错误:', error);
-      }
-    }
-  }
-
-  /**
-   * 发送兼容类型的媒体组（带自动切分和错误回退）
-   */
-  private static async sendCompatibleMediaGroup(
-    bot: Telegraf, 
-    channelId: string, 
-    items: any[], 
-    caption: string
-  ): Promise<void> {
-    const chunks = this.chunkArray(items, 10);
-    
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i];
-      if (chunk.length === 1) {
-        // 只有一个媒体，直接发送
-        try {
-          await this.sendSingleMediaToChannel(bot, channelId, { ...chunk[0], caption: i === 0 ? caption : '' });
-        } catch (err) {
-          throw err;
-        }
-        continue;
-      }
-
-      try {
-        const mediaGroup = chunk.map((item, index) => {
-          // Telegram API 要求 animation 在 media group 中必须标记为 video
-          const type = item.file_type === 'animation' ? 'video' : item.file_type;
-          return {
-            type: type as any,
-            media: item.file_id,
-            caption: (i === 0 && index === 0 && caption) ? caption : undefined
-          };
-        });
-
-        await this.withTimeout(
-          bot.telegram.sendMediaGroup(channelId, mediaGroup),
-          60000,
-          'sendMediaGroup'
-        );
-        console.log(`✅ 媒体组发送成功 (${chunk.length} 个媒体)`);
-      } catch (error) {
-        console.error('媒体组发送失败，保留相册，不自动拆图:', error);
-        throw error;
-      }
-
-      if (i < chunks.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
-      }
-    }
-  }
-
-  private static async sendSingleMediaToChannel(bot: Telegraf, channelId: string, item: any): Promise<void> {
-    const caption = item.caption || '';
-    
-    switch (item.file_type) {
-      case 'photo':
-        await bot.telegram.sendPhoto(channelId, item.file_id, { caption });
-        break;
-      case 'video':
-        await bot.telegram.sendVideo(channelId, item.file_id, { caption });
-        break;
-      case 'document':
-        await bot.telegram.sendDocument(channelId, item.file_id, { caption });
-        break;
-      case 'audio':
-        await bot.telegram.sendAudio(channelId, item.file_id, { caption });
-        break;
-      case 'voice':
-        await bot.telegram.sendVoice(channelId, item.file_id, { caption });
-        break;
-      case 'animation':
-        await bot.telegram.sendAnimation(channelId, item.file_id, { caption });
-        break;
-      case 'video_note':
-        await bot.telegram.sendVideoNote(channelId, item.file_id);
-        break;
-    }
+      return count;
+    });
   }
 
   private static groupMediaByType(mediaItems: any[]): { [key: string]: any[] } {

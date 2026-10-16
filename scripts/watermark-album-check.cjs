@@ -8,6 +8,8 @@ Object.assign(process.env, { BOT_TOKEN: 'offline', SUPER_ADMIN_ID: '1', DATABASE
 const { WatermarkService, watermarkService } = require('../dist/services/watermark');
 const { UploadHandler } = require('../dist/bot/handlers/UploadHandler');
 const { PublishHandler } = require('../dist/bot/handlers/PublishHandler');
+const { publicationQueue } = require('../dist/services/publicationQueue');
+publicationQueue.timing = { channel: 0, group: 0, timeout: 1000, globalPerMessage: 0 };
 const dirs = [];
 function prepare(service) {
   service.assertReady = async () => {};
@@ -50,10 +52,12 @@ const tg = {
   assert.equal(groups.length, 1); assert.equal(groups[0].chat, '-2002');
   assert.deepEqual(groups[0].items.map(m => m.type), ['video', 'photo']);
   const failTg = { ...tg, sendMediaGroup: async () => { throw Error('simulated timeout'); } };
-  const fail = await UploadHandler.publishOneBatch(failTg, '-2002', items, '11', db, {});
-  assert.equal(fail.failed, 2); assert.equal(singles, 0);
-  await assert.rejects(PublishHandler.sendCompatibleMediaGroup({ telegram: failTg }, '-2002', items, 'caption'));
+  await assert.rejects(UploadHandler.publishOneBatch(failTg, '-2002', items, '11', db, {}));
   assert.equal(singles, 0);
+  await publicationQueue.resume(tg, '-2002');
+  await assert.rejects(PublishHandler.publishToChannel({ telegram: failTg }, '-2002', items, 'caption'));
+  assert.equal(singles, 0);
+  await publicationQueue.resume(tg, '-2002');
   await assert.rejects(UploadHandler.publishOneBatch(tg, '-2002', items, '11',
     { updateMediaSource: async () => { throw Error('disk failed'); } }, {}), /disk failed/);
   assert.equal(singles, 0);

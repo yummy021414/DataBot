@@ -6,6 +6,7 @@ import { recordPublishEvent } from '../../services/publishAudit';
 import { checkVaultAccess } from '../../services/vault';
 import { tagCaptionForMedia } from '../../utils/keywordTag';
 import { watermarkService } from '../../services/watermark';
+import { publicationQueue, publicationBatches, publicationChunks, PublishSender } from '../../services/publicationQueue';
 
 export class UploadHandler {
   /** 同一 Telegram 相册内收齐等待（ms） */
@@ -955,11 +956,10 @@ export class UploadHandler {
         }
       }
 
-      // 按所选目标逐个同步发布。单个目标失败不阻止其余群/频道继续发送。
+      // 不同目标并行排队，公共队列限制并发；单个目标失败不阻止其余目标。
       const publishResults: Array<{ channelId: string; sent: number }> = [];
       const publishFailures: Array<{ channelId: string; error: string }> = [];
-      for (let index = 0; index < session.selectedChannels.length; index++) {
-        const channelId = session.selectedChannels[index];
+      await Promise.all([...new Set(session.selectedChannels)].map(async channelId => {
         try {
           const targetItems = channelId === persistentChannelId
             ? savedItems.filter(item => !session.pendingMedia.some(m => m.file_id === item.file_id && m.watermark_album_saved))
@@ -982,10 +982,7 @@ export class UploadHandler {
           publishFailures.push({ channelId, error: detail });
           console.error(`保存并发布到 ${channelId} 失败:`, detail);
         }
-        if (index < session.selectedChannels.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 1200));
-        }
-      }
+      }));
       if (publishResults.length === 0) {
         throw new Error(`无法发布到所选目标：${publishFailures.map(item => `${item.channelId}（${item.error}）`).join('；')}`);
       }
@@ -1079,7 +1076,6 @@ export class UploadHandler {
     const telegram = (botOrCtx as any).telegram || (botOrCtx as any).tg || (botOrCtx as Context).telegram;
     const writeSource = options?.writeSource !== false;
     const forceSource = Boolean(options?.forceSource);
-    const requireSuccess = Boolean(options?.requireSuccess);
 
     if (forceSource) {
       const access = await checkVaultAccess(telegram, channelId);
@@ -1095,135 +1091,34 @@ export class UploadHandler {
       console.log(`✅ [发布预检] ${access.type}「${access.title}」bot=@${access.botUsername} status=${access.botStatus}`);
     }
 
-    const batches: { [key: string]: MediaItem[] } = {};
-    for (const item of mediaList) {
-      const bId = item.batchId || `legacy_${item.id}`;
-      if (!batches[bId]) batches[bId] = [];
-      batches[bId].push(item);
-    }
-    const batchIds = Object.keys(batches);
-    console.log(`📢 [上传发布] 关键词="${keyword}" 共 ${batchIds.length} 组 / ${mediaList.length} 文件 → 频道 ${channelId}`);
-
-    let sent = 0;
-    let failed = 0;
-    for (let bi = 0; bi < batchIds.length; bi++) {
-      const r = await this.publishOneBatch(telegram, channelId, batches[batchIds[bi]], keyword, db, {
-        writeSource,
-        forceSource
-      });
-      sent += r.sent;
-      failed += r.failed;
-      if (bi < batchIds.length - 1) {
-        await new Promise(r => setTimeout(r, 1500));
+    const batches = publicationBatches(mediaList);
+    return publicationQueue.run(telegram, channelId, async send => {
+      let sent = 0;
+      for (const batch of batches) {
+        const result = await this.publishOneBatch(telegram, channelId, batch, keyword, db, { writeSource, forceSource }, send);
+        sent += result.sent;
       }
-    }
-
-    console.log(`📋 发送结束：成功 ${sent}，失败 ${failed}`);
-    if (requireSuccess && sent === 0) {
-      throw new Error(`全部发送失败（0/${mediaList.length}），目标 ${channelId}`);
-    }
-    if (requireSuccess && failed > 0 && sent < mediaList.length) {
-      throw new Error(`部分发送失败 ${failed}/${mediaList.length}，未自动拆散相册`);
-    }
-    return { sent, failed };
+      return { sent, failed: 0 };
+    });
   }
 
-  /** 发布单个 batch（一组相册） */
   private static async publishOneBatch(
-    telegram: any,
-    channelId: string,
-    batchItems: MediaItem[],
-    keyword: string,
-    db: typeof database,
-    options?: { writeSource?: boolean; forceSource?: boolean }
+    telegram: any, channelId: string, batchItems: MediaItem[], keyword: string, db: typeof database,
+    options?: { writeSource?: boolean; forceSource?: boolean }, sender?: PublishSender
   ): Promise<{ sent: number; failed: number }> {
-    const writeSource = options?.writeSource !== false;
-    const forceSource = Boolean(options?.forceSource);
-    let sent = 0;
-    let failed = 0;
-    const recordSource = async (id: number, msgId: number) => {
-      if (!writeSource) return;
-      await db.updateMediaSource(id, channelId, msgId, { force: forceSource });
-    };
-
-    const groupedMedia = this.groupMediaByType(batchItems);
-    // Preserve original order; Telegram only permits compatible media in one album.
-    const visual = batchItems.filter(m => m.file_type === 'photo' || m.file_type === 'video');
-    const documentItems = batchItems.filter(m => m.file_type === 'document');
-    const audioItems = batchItems.filter(m => m.file_type === 'audio');
-    const mainCaption = batchItems.map(m => (m.caption || (m as any).groupCaption || '').trim()).find(Boolean) || '';
-    let captionUsed = false;
-    for (const compatible of [visual, documentItems, audioItems]) {
-      for (const chunk of this.chunkArray(compatible, 10)) {
-        const caption = captionUsed ? '' : mainCaption;
-        captionUsed = true;
-        let messages: any[];
-        try {
-          if (chunk.length === 1) {
-            const message = await this.sendSingleMediaToChannel(telegram, channelId, { ...chunk[0], caption }, keyword);
-            if (!message) throw new Error('未取得发送结果');
-            messages = [message];
-          } else {
-            messages = await telegram.sendMediaGroup(channelId, chunk.map((item, index) => ({
-              type: item.file_type, media: item.file_id, caption: index === 0 ? caption || undefined : undefined
-            })));
-          }
-        } catch (error) {
-          // Never resend an uncertain/failed album as individual messages.
-          console.error('相册发送失败，保留原分组，不自动拆图:', error);
-          failed += chunk.length;
-          continue;
-        }
-        if (messages.length !== chunk.length) throw new Error('相册返回数量不一致');
+    const work = async (send: PublishSender) => {
+      let sent = 0;
+      for (const chunk of publicationChunks(batchItems)) {
+        const messages = await send(chunk);
         for (let i = 0; i < messages.length; i++) {
-          // Persistence failures must not trigger another Telegram send.
-          await recordSource(chunk[i].id, messages[i].message_id);
+          if (options?.writeSource !== false) await db.updateMediaSource(chunk[i].id, channelId, messages[i].message_id,
+            { force: Boolean(options?.forceSource) });
           sent++;
         }
       }
-    }
-
-    const voiceItems = groupedMedia['voice'] || [];
-    for (const item of voiceItems) {
-      try {
-        const msg = await this.sendSingleMediaToChannel(telegram, channelId, item, keyword);
-        if (msg) {
-          await recordSource(item.id, msg.message_id);
-          sent++;
-        } else {
-          failed++;
-        }
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      } catch (error) {
-        failed++;
-        console.error('发送语音消息错误:', error);
-      }
-    }
-
-    return { sent, failed };
-  }
-
-  private static async sendSingleMediaToChannel(telegram: any, channelId: string, item: any, keyword?: string): Promise<any> {
-    const caption = this.buildCaption(keyword || '', item.caption);
-    
-    switch (item.file_type) {
-      case 'photo':
-        return await telegram.sendPhoto(channelId, item.file_id, { caption });
-      case 'video':
-        return await telegram.sendVideo(channelId, item.file_id, { caption });
-      case 'document':
-        return await telegram.sendDocument(channelId, item.file_id, { caption });
-      case 'audio':
-        return await telegram.sendAudio(channelId, item.file_id, { caption });
-      case 'voice':
-        return await telegram.sendVoice(channelId, item.file_id, { caption });
-      case 'animation':
-        return await telegram.sendAnimation(channelId, item.file_id, { caption });
-      case 'video_note':
-        return await telegram.sendVideoNote(channelId, item.file_id);
-      default:
-        return null;
-    }
+      return { sent, failed: 0 };
+    };
+    return sender ? work(sender) : publicationQueue.run(telegram, channelId, work);
   }
 
   private static groupMediaByType(mediaList: any[]): { [key: string]: any[] } {
