@@ -18,6 +18,14 @@ export class Database {
     return this.jsonDb.getMediaByKeyword(keyword, userId);
   }
 
+  async recordKeywordSearch(userId: number, keyword: string, now?: number): Promise<void> {
+    return this.jsonDb.recordKeywordSearch(userId, keyword, now);
+  }
+
+  async getRecentSearches(userId: number, scopeUserId?: number, now?: number) {
+    return this.jsonDb.getRecentSearches(userId, scopeUserId, now);
+  }
+
   async getReviewsByKeyword(keyword: string): Promise<MediaItem[]> {
     return this.jsonDb.getReviewsByKeyword(keyword);
   }

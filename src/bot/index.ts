@@ -5,6 +5,7 @@ import { BotMode, UserSession } from '../types';
 import { database } from '../database';
 import { SearchHandler } from './handlers/SearchHandler';
 import { ReplaceGroupHandler } from './handlers/ReplaceGroupHandler';
+import { RecentSearchHandler } from './handlers/RecentSearchHandler';
 import { UploadHandler } from './handlers/UploadHandler';
 import { PublishHandler } from './handlers/PublishHandler';
 import { scheduledPublish } from '../services/scheduledPublish';
@@ -333,6 +334,8 @@ export class TelegramBot {
     this.bot.action('exit_chat', this.handleExitChat.bind(this));
     this.bot.action(/^disconnect_chat_/, this.handleDisconnectChat.bind(this));
     this.bot.action(/^keywords_page_(\d+)$/, this.handleKeywordsPage.bind(this));
+    this.bot.action('recent_searches', ctx => RecentSearchHandler.handle(ctx, database));
+    this.bot.action(/^recent_search:/, ctx => RecentSearchHandler.handle(ctx, database));
     this.bot.action(/^keyword_/, this.handleKeywordClick.bind(this));
     this.bot.action(/^search_/, this.handleSearchKeyword.bind(this));
     this.bot.action('broadcast_text', this.handleBroadcastText.bind(this));
@@ -831,6 +834,7 @@ export class TelegramBot {
           Markup.inlineKeyboard([
             [Markup.button.callback('🏷️ 标签筛选', 'start_tag_filter')],
             ...(isAdmin ? [[Markup.button.callback('🛡️ 水印管理', 'watermark_menu')]] : []),
+            [Markup.button.callback('🕘 最近搜索', 'recent_searches')],
             [Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]
           ]));
         return;
@@ -2863,6 +2867,7 @@ export class TelegramBot {
     if (ctx.from?.id && this.isAdmin(ctx.from.id)) {
       navigationButtons.push([Markup.button.callback('🛡️ 水印管理', 'watermark_menu')]);
     }
+    navigationButtons.push([Markup.button.callback('🕘 最近搜索', 'recent_searches')]);
     navigationButtons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
     const allButtons = [...keywordButtons, ...navigationButtons];
         const text = `🔍 关键词列表 (第 ${page + 1}/${totalPages} 页)\n\n` +

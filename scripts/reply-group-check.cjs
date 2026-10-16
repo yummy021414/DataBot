@@ -89,6 +89,34 @@ function button(label) {
   await callback(db, save); // Stale buttons cannot repeat the replacement.
   assert.equal((await db.getSearchGroup(99, second)).length, 3);
 
+  // Replace the whole group only after receiving new caption/media and confirming.
+  await ReplaceGroupHandler.handleMessage(context(1, '替换', second), db);
+  await callback(db, button('整组替换（文案＋照片/视频）'));
+  const finishWhole = button('✅ 完成替换');
+  const newPhoto = context();
+  newPhoto.message = { message_id: ++sentId, photo: [{ file_id: 'whole-photo' }] };
+  await ReplaceGroupHandler.handleMessage(newPhoto, db);
+  await callback(db, finishWhole);
+  assert.match(replies.at(-1).text, /请先发送新文案/);
+  assert.equal((await db.getSearchGroup(99, second)).length, 3);
+  const newVideo = context();
+  newVideo.message = { message_id: ++sentId, video: { file_id: 'whole-video' }, caption: '整组新文案' };
+  await ReplaceGroupHandler.handleMessage(newVideo, db);
+  await callback(db, finishWhole);
+  const confirmWhole = button('✅ 确认整组替换');
+  assert.match(replies.at(-1).text, /1 张照片，1 个视频/);
+  assert.equal((await db.getSearchGroup(99, second)).length, 3);
+  await ReplaceGroupHandler.handleMessage(context(1, '最终文案'), db);
+  await callback(db, confirmWhole);
+  assert.match(replies.at(-1).text, /内容有变化/);
+  await callback(db, finishWhole);
+  await callback(db, button('✅ 确认整组替换'));
+  group = await db.getSearchGroup(99, second);
+  assert.deepEqual(group.map(m => m.file_id), ['whole-photo', 'whole-video']);
+  assert.equal(group[0].caption, '最终文案\n#测试');
+  assert.equal(group[1].caption, undefined);
+  assert.equal((await db.getSearchGroup(99, third))[0].caption, '旧文案\n#测试');
+
   const stale = await db.getSearchGroup(99, third);
   await db.replaceSearchGroup(99, third, 1, stale, stale.map(m => ({ ...m, caption: 'changed' })));
   await assert.rejects(db.replaceSearchGroup(99, third, 1, stale, stale), /发生变化/);

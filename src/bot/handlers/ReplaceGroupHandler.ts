@@ -10,8 +10,10 @@ interface ReplacementSession {
   token: string;
   chatId: number;
   messageId: number;
-  mode: 'choose' | 'caption' | 'photos';
-  photos: Array<{ fileId: string; messageId: number }>;
+  mode: 'choose' | 'caption' | 'photos' | 'whole';
+  photos: Array<{ fileId: string; messageId: number; type: 'photo' | 'video' }>;
+  newCaption?: string;
+  previewed?: boolean;
   expires: number;
   busy: boolean;
   expected: MediaItem[];
@@ -42,6 +44,7 @@ export class ReplaceGroupHandler {
       [Markup.button.callback('取消', prefix + 'cancel')]
     ] : [
       [Markup.button.callback('替换文案', prefix + 'caption'), Markup.button.callback('替换照片', prefix + 'photos')],
+      [Markup.button.callback('整组替换（文案＋照片/视频）', prefix + 'whole')],
       [Markup.button.callback('取消', prefix + 'cancel')]
     ]);
   }
@@ -90,9 +93,20 @@ export class ReplaceGroupHandler {
       finally { session.busy = false; }
       return true;
     }
-    if ('photo' in message) {
+    if (session.mode === 'whole') {
+      const incomingCaption = text || ('caption' in message ? message.caption : '');
+      if (incomingCaption?.trim()) {
+        try { session.newCaption = appendKeywordTag(incomingCaption, session.expected[0].keyword); }
+        catch (error: any) { await ctx.reply('❌ ' + error.message); return true; }
+        session.previewed = false;
+        if (text) { await ctx.reply('已收到新文案，请发送照片／视频，收齐后点击“完成替换”。'); return true; }
+      }
+    }
+    if ('photo' in message || (session.mode === 'whole' && 'video' in message)) {
       if (!session.photos.some(photo => photo.messageId === message.message_id)) {
-        session.photos.push({ fileId: message.photo[message.photo.length - 1].file_id, messageId: message.message_id });
+        session.photos.push({ fileId: 'photo' in message ? message.photo[message.photo.length - 1].file_id : message.video.file_id,
+          type: 'photo' in message ? 'photo' : 'video', messageId: message.message_id });
+        session.previewed = false;
       }
       // A finish button is shown before collecting, so albums need no timing heuristic.
       return true;
@@ -118,32 +132,52 @@ export class ReplaceGroupHandler {
       await ctx.editMessageText('已取消替换。');
       return;
     }
-    if (action === 'caption' || action === 'photos') {
+    if (action === 'caption' || action === 'photos' || action === 'whole') {
       try { await db.getSearchGroup(session.chatId, session.messageId, this.scope(ctx)); }
       catch (error: any) { this.sessions.delete(key); await ctx.reply(`❌ ${error.message}`); return; }
       session.mode = action;
       session.photos = [];
+      session.newCaption = undefined;
+      session.previewed = false;
       session.expires = Date.now() + 30 * 60 * 1000;
       if (action === 'caption') {
         await ctx.editMessageText('请发送这组资料的新文案（含关键词标签不超过 1024 字符），或回复“取消”。',
           Markup.inlineKeyboard([[Markup.button.callback('取消', `replace_group:${token}:cancel`)]]));
+      } else if (action === 'whole') {
+        await ctx.editMessageText('请发送新的照片／视频和文案。文字可随图片发送，也可单独发送。\n收齐后点击“完成替换”查看摘要，再确认覆盖整组旧资料。', this.keyboard(session, true));
       } else {
         await ctx.editMessageText('请发送新照片，可连续发送多张。全部发送后点击“完成替换”。\n原有文案、视频等其他文件保留。', this.keyboard(session, true));
       }
       return;
     }
-    if (action !== 'save' || session.mode !== 'photos') return;
+    if (!['save', 'confirm'].includes(action) || !['photos', 'whole'].includes(session.mode)) return;
+    if (action === 'confirm' && session.mode !== 'whole') return;
     if (!session.photos.length) { await ctx.reply('请先发送新照片。'); return; }
+    if (session.mode === 'whole') {
+      if (!session.newCaption) { await ctx.reply('请先发送新文案，再完成替换。'); return; }
+      if (action === 'save') {
+        session.previewed = true;
+        const photos = session.photos.filter(item => item.type === 'photo').length;
+        await ctx.reply('整组替换预览：\n关键词：' + session.expected[0].keyword +
+          '\n新资料：' + photos + ' 张照片，' + (session.photos.length - photos) + ' 个视频\n\n' + session.newCaption +
+          '\n\n确认后覆盖这一整组旧资料。', Markup.inlineKeyboard([
+            [Markup.button.callback('✅ 确认整组替换', 'replace_group:' + token + ':confirm')],
+            [Markup.button.callback('取消', 'replace_group:' + token + ':cancel')]
+          ]));
+        return;
+      }
+      if (!session.previewed) { await ctx.reply('内容有变化，请重新点击“完成替换”查看预览。', this.keyboard(session, true)); return; }
+    }
     session.busy = true;
     try {
       const current = await db.getSearchGroup(session.chatId, session.messageId, this.scope(ctx));
       if (JSON.stringify(current) !== JSON.stringify(session.expected)) throw new Error('资料已发生变化，请重新引用并替换');
-      const caption = current.find(item => item.caption)?.caption;
+      const caption = session.mode === 'whole' ? session.newCaption : current.find(item => item.caption)?.caption;
       const base = current[0];
       const vault = getAdminPersistentChannelId(base.uploaded_by);
       const photos: MediaItem[] = session.photos.map((photo, index) => ({
         id: -(index + 1), keyword: base.keyword, batchId: base.batchId, uploaded_by: base.uploaded_by,
-        uploaded_at: base.uploaded_at, is_published: false, file_type: 'photo', file_id: photo.fileId,
+        uploaded_at: base.uploaded_at, is_published: false, file_type: photo.type, file_id: photo.fileId,
         source_chat_id: String(session.chatId), source_msg_id: photo.messageId
       }));
       await ctx.reply('正在保存新照片，请稍候。');
@@ -152,9 +186,9 @@ export class ReplaceGroupHandler {
         for (let offset = 0; offset < photos.length; offset += 10) {
           const chunk = photos.slice(offset, offset + 10);
           const results = await watermarkService.processTelegramAlbum(ctx.telegram,
-            chunk.map(item => ({ fileId: item.file_id, type: 'photo' })), vault!, offset === 0 ? caption || '' : '');
+            chunk.map(item => ({ fileId: item.file_id, type: item.file_type as 'photo' | 'video', ready: item.file_type !== 'photo' })), vault!, offset === 0 ? caption || '' : '');
           results.forEach((result, index) => Object.assign(chunk[index], {
-            original_file_id: chunk[index].file_id, file_id: result.fileId, watermarked: true,
+            original_file_id: chunk[index].file_id, file_id: result.fileId, watermarked: chunk[index].file_type === 'photo',
             watermark_version: result.version, watermarked_at: new Date().toISOString(),
             source_chat_id: result.sourceChatId, source_msg_id: result.sourceMsgId
           }));
@@ -166,11 +200,11 @@ export class ReplaceGroupHandler {
           photo.source_msg_id = sent.message_id;
         }
       }
-      const updated = [...photos, ...current.filter(item => item.file_type !== 'photo')]
+      const updated = [...photos, ...(session.mode === 'whole' ? [] : current.filter(item => item.file_type !== 'photo'))]
         .map((item, index) => ({ ...item, caption: index === 0 ? caption : undefined }));
       await db.replaceSearchGroup(session.chatId, session.messageId, this.scope(ctx), current, updated);
       this.sessions.delete(key);
-      await ctx.editMessageText(`✅ 这组资料的照片已替换为 ${photos.length} 张，重新搜索即可查看。`);
+      await ctx.editMessageText(session.mode === 'whole' ? '✅ 这组资料的文案和媒体已全部替换，重新搜索即可查看。' : `✅ 这组资料的照片已替换为 ${photos.length} 张，重新搜索即可查看。`);
     } catch (error: any) {
       await ctx.reply(`❌ 替换未完成：${error.message}。可点击“完成替换”重试或取消。`);
     } finally { session.busy = false; }

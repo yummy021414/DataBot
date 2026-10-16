@@ -145,6 +145,7 @@ export class SearchHandler {
         }
 
         anyFound = true;
+        await db.recordKeywordSearch(userId, kw).catch(error => console.error('搜索统计保存失败:', error));
         const photoCount = mediaItems.filter(item => item.file_type === 'photo').length;
         const videoCount = mediaItems.filter(item => item.file_type === 'video').length;
         const documentCount = mediaItems.filter(item => item.file_type === 'document').length;

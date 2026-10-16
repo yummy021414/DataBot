@@ -21,6 +21,7 @@ interface ChatMessageRecord {
 }
 
 interface DatabaseData {
+  searchUsage?: Array<{ userId: number; keyword: string; day: string; count: number; lastAt: number }>;
   media: MediaItem[];
   userPermissions: UserPermission[];
   userSessions: { [userId: number]: any };
@@ -73,6 +74,7 @@ export class JsonDatabase {
         // 兼容旧数据：如果没有users字段，初始化为空数组
         this.data = {
           media: loadedData.media || [],
+          searchUsage: Array.isArray(loadedData.searchUsage) ? loadedData.searchUsage : [],
           searchReplyGroups: this.normalizeObjectMap(loadedData.searchReplyGroups),
           userPermissions: loadedData.userPermissions || [],
           userSessions: this.normalizeObjectMap(loadedData.userSessions),
@@ -178,6 +180,7 @@ export class JsonDatabase {
     const albums = this.normalizeObjectMap(this.data.albums);
     const payload = {
       media: this.data.media || [],
+      searchUsage: this.data.searchUsage || [],
       searchReplyGroups: this.data.searchReplyGroups || {},
       userPermissions: this.data.userPermissions || [],
       userSessions: this.uploadSessionSnapshots(),
@@ -286,6 +289,30 @@ export class JsonDatabase {
     
     // 🚀 核心修复：按上传时间升序排列，确保“组”的逻辑顺序
     return results.sort((a, b) => new Date(a.uploaded_at).getTime() - new Date(b.uploaded_at).getTime());
+  }
+
+  async recordKeywordSearch(userId: number, keyword: string, now = Date.now()): Promise<void> {
+    const day = new Date(now).toISOString().slice(0, 10);
+    const cutoff = new Date(now - 29 * 86400000).toISOString().slice(0, 10);
+    this.data.searchUsage = (this.data.searchUsage || []).filter(entry => entry.day >= cutoff);
+    const entry = this.data.searchUsage.find(entry => entry.userId === userId && entry.keyword === keyword && entry.day === day);
+    if (entry) { entry.count++; entry.lastAt = now; }
+    else this.data.searchUsage.push({ userId, keyword, day, count: 1, lastAt: now });
+    this.saveData();
+  }
+
+  async getRecentSearches(userId: number, scopeUserId?: number, now = Date.now()): Promise<Array<{ keyword: string; count: number; lastAt: number }>> {
+    const cutoff = new Date(now - 29 * 86400000).toISOString().slice(0, 10);
+    const available = new Set(await this.getAllKeywords(scopeUserId));
+    const totals = new Map<string, { keyword: string; count: number; lastAt: number }>();
+    for (const entry of this.data.searchUsage || []) {
+      if (entry.userId !== userId || entry.day < cutoff || !available.has(entry.keyword)) continue;
+      const total = totals.get(entry.keyword) || { keyword: entry.keyword, count: 0, lastAt: 0 };
+      total.count += entry.count;
+      total.lastAt = Math.max(total.lastAt, entry.lastAt);
+      totals.set(entry.keyword, total);
+    }
+    return [...totals.values()].sort((a, b) => b.count - a.count || b.lastAt - a.lastAt || a.keyword.localeCompare(b.keyword));
   }
 
   // 🚀 新增：专门获取好评图
