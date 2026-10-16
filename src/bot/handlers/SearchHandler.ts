@@ -4,7 +4,31 @@ import { MediaItem } from '../../types';
 import { config, isAdminUser, isSuperAdmin } from '../../config';
 import { refreshFileIdFromVault } from '../../services/vault';
 
+type SentRecorder = (messages: { message_id: number }[]) => Promise<void>;
+
 export class SearchHandler {
+  static async handleReplyDelete(ctx: Context, db: typeof database): Promise<boolean> {
+    const message = ctx.message;
+    if (!message || !('text' in message) || message.text.trim() !== '删除' || !message.reply_to_message) return false;
+    if (!ctx.from || !ctx.chat) return true;
+    try {
+      const result = await db.deleteSearchGroup(ctx.chat.id, message.reply_to_message.message_id,
+        isSuperAdmin(ctx.from.id) ? undefined : ctx.from.id);
+      if (result.status === 'forbidden') {
+        await ctx.reply('❌ 只能删除自己的资料。');
+      } else if (result.status === 'missing') {
+        await ctx.reply('❌ 未找到这条消息对应的资料组，可能已经删除。请重新搜索关键词，引用要删除的那组资料并回复“删除”。');
+      } else {
+        await ctx.reply('✅ 已删除「' + result.keyword + '」的这组资料（' + result.count + ' 个文件）。' +
+          (result.remainingGroups ? '\n该关键词还剩 ' + result.remainingGroups + ' 组资料。' : '\n这是最后一组资料，关键词已从资料库移除。'));
+      }
+    } catch (error) {
+      console.error('引用删除资料失败:', error);
+      await ctx.reply('❌ 删除失败，请稍后重试。');
+    }
+    return true;
+  }
+
   /**
    * 解析一次输入里的多个关键词：
    * - 整句精确匹配优先（避免「优米樊樊」本身就是一个词时被拆开）
@@ -140,7 +164,15 @@ export class SearchHandler {
           const batchItems = batches[batchIds[i]];
           const groupedMedia = this.groupMediaByType(batchItems);
           try {
-            await this.sendMediaGroups(ctx, groupedMedia, true);
+            await this.sendMediaGroups(ctx, groupedMedia, true, async messages => {
+              try {
+                await db.rememberSearchGroup(ctx.chat!.id, messages.map(message => message.message_id), batchItems);
+              } catch (error) {
+                // Recording failure is not a Telegram send failure; do not resend the media.
+                console.error('搜索结果引用记录保存失败:', error);
+                await ctx.reply('⚠️ 资料已发送，但引用记录保存失败。请稍后重新搜索，再使用引用删除或替换。').catch(() => {});
+              }
+            });
           } catch (err: any) {
             console.error(`[搜索发送失败] 关键词="${kw}" 组 ${i + 1}:`, err.message);
           }
@@ -173,7 +205,7 @@ export class SearchHandler {
     const batches: { [key: string]: MediaItem[] } = {};
     
     mediaItems.forEach(item => {
-      const bId = item.batchId || 'default';
+      const bId = JSON.stringify([item.uploaded_by, item.batchId || 'default']);
       if (!batches[bId]) {
         batches[bId] = [];
       }
@@ -244,7 +276,7 @@ export class SearchHandler {
     return emojiMap[type] || '📎';
   }
 
-  public static async sendMediaGroups(ctx: Context, groupedMedia: { [key: string]: MediaItem[] }, sendCaption: boolean = true): Promise<void> {
+  public static async sendMediaGroups(ctx: Context, groupedMedia: { [key: string]: MediaItem[] }, sendCaption: boolean = true, record?: SentRecorder): Promise<void> {
     // 完全按照上传时的格式：所有媒体一起发送，文字说明只显示一次
     
     // 获取所有媒体
@@ -270,23 +302,23 @@ export class SearchHandler {
     // 1. 发送照片、视频、动画组合
     const visualMedia = [...photoItems, ...videoItems, ...animationItems];
     if (visualMedia.length > 0) {
-      await this.sendCompatibleMediaGroup(ctx, visualMedia, mainCaption);
+      await this.sendCompatibleMediaGroup(ctx, visualMedia, mainCaption, record);
     }
 
     // 2. 发送文档组合
     if (documentItems.length > 0) {
-      await this.sendCompatibleMediaGroup(ctx, documentItems, visualMedia.length === 0 ? mainCaption : '');
+      await this.sendCompatibleMediaGroup(ctx, documentItems, visualMedia.length === 0 ? mainCaption : '', record);
     }
 
     // 3. 发送音频组合
     if (audioItems.length > 0) {
-      await this.sendCompatibleMediaGroup(ctx, audioItems, (visualMedia.length === 0 && documentItems.length === 0) ? mainCaption : '');
+      await this.sendCompatibleMediaGroup(ctx, audioItems, (visualMedia.length === 0 && documentItems.length === 0) ? mainCaption : '', record);
     }
     
     // 4. 发送语音消息（不能放在媒体组中）
     for (const item of voiceItems) {
       try {
-        await this.sendSingleMedia(ctx, item);
+        await this.sendSingleMedia(ctx, item, record);
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (error) {
         console.error('发送语音消息错误:', error);
@@ -296,7 +328,7 @@ export class SearchHandler {
     // 5. 发送视频动态（不能放在媒体组中）
     for (const item of videoNoteItems) {
       try {
-        await this.sendSingleMedia(ctx, item);
+        await this.sendSingleMedia(ctx, item, record);
         await new Promise(resolve => setTimeout(resolve, 1000));
       } catch (error) {
         console.error('发送视频动态错误:', error);
@@ -310,7 +342,8 @@ export class SearchHandler {
   private static async sendCompatibleMediaGroup(
     ctx: Context, 
     items: MediaItem[], 
-    caption: string
+    caption: string,
+    record?: SentRecorder
   ): Promise<void> {
     const chunks = this.chunkArray(items, 10);
     const chatId = ctx.chat?.id;
@@ -318,6 +351,26 @@ export class SearchHandler {
 
     // 🚀 核心改进：Bot 级自愈（保持 Bot 身份 + 相册完整）
     const tryBotLevelHealing = async (chunk: MediaItem[]) => {
+      // Migrated watermark copies can be individual vault messages. Reclaim ids and
+      // reconstruct the album from database metadata instead of copying isolated posts.
+      if (chunk.length > 0) {
+        try {
+          for (const item of chunk) {
+            const result = await refreshFileIdFromVault(ctx.telegram, item, database, item.source_chat_id);
+            if (!result.ok) throw new Error('金库认领失败');
+          }
+          const sent = await ctx.replyWithMediaGroup(chunk.map((item, index) => ({
+            type: (item.file_type === 'animation' ? 'video' : item.file_type) as any,
+            media: item.file_id,
+            caption: index === 0 ? caption || undefined : undefined
+          })));
+          if (record) await record(sent);
+          return true;
+        } catch {
+          // A changed caption must never be restored from an old vault post.
+          if (chunk.some(item => item.watermarked || item.caption_overridden)) return false;
+        }
+      }
       const sourceChatId = chunk[0]?.source_chat_id;
       const sourceMsgIds = chunk.map(m => m.source_msg_id).filter(id => id) as number[];
       
@@ -335,6 +388,7 @@ export class SearchHandler {
           });
 
           if (result) {
+            if (record) await record(result);
             console.log(`[Bot自愈成功] 资料已由 Bot 完美复刻送达`);
             // 后台认领新 file_id，下次可直接用 file_id 发送
             for (const m of chunk) {
@@ -348,6 +402,7 @@ export class SearchHandler {
           console.warn(`[Bot自愈受阻] Bot 无法直接复制 (${botErr.message})，降级为 UserBot 转发...`);
           const { accountController } = require('../../userAccount');
           const healed = await accountController.forwardByPermanentIds(chatId, sourceChatId, sourceMsgIds);
+          if (record && healed.messageIds?.length) await record(healed.messageIds.map((id: number) => ({ message_id: id })));
           return healed.success;
         }
       }
@@ -358,7 +413,7 @@ export class SearchHandler {
       const chunk = chunks[i];
       if (chunk.length === 1) {
         try {
-          await this.sendSingleMedia(ctx, chunk[0]);
+          await this.sendSingleMedia(ctx, chunk[0], record);
         } catch (err) {}
         continue;
       }
@@ -373,7 +428,8 @@ export class SearchHandler {
           };
         });
 
-        await ctx.replyWithMediaGroup(mediaGroup);
+        const sent = await ctx.replyWithMediaGroup(mediaGroup);
+        if (record) await record(sent);
       } catch (error: any) {
         // 如果整组发送失败（常见于 Token 变更后的 file_id 失效）
         const handled = await tryBotLevelHealing(chunk);
@@ -381,7 +437,7 @@ export class SearchHandler {
           console.error('媒体组发送失败且自愈失败，尝试逐个发送:', error.message);
           for (const item of chunk) {
             try {
-              await this.sendSingleMedia(ctx, item);
+              await this.sendSingleMedia(ctx, item, record);
               await new Promise(resolve => setTimeout(resolve, 1000));
             } catch (singleError) {}
           }
@@ -394,7 +450,7 @@ export class SearchHandler {
     }
   }
 
-  private static async sendSingleMedia(ctx: Context, item: MediaItem): Promise<void> {
+  private static async sendSingleMedia(ctx: Context, item: MediaItem, record?: SentRecorder): Promise<void> {
     const caption = item.caption || '';
     const chatId = ctx.chat?.id;
     if (!chatId) return;
@@ -403,15 +459,18 @@ export class SearchHandler {
       if (item.source_chat_id && item.source_msg_id) {
         console.log(`[单项Bot自愈] 正在尝试由 Bot 直接复刻...`);
         try {
-          await ctx.telegram.copyMessage(chatId, item.source_chat_id, item.source_msg_id);
+          const sent = await ctx.telegram.copyMessage(chatId, item.source_chat_id, item.source_msg_id, { caption });
+          if (record) await record([sent]);
           refreshFileIdFromVault(ctx.telegram, item, database).then(r => {
             if (r.ok) console.log(`[金库认领] media#${item.id} file_id 已刷新`);
           }).catch(() => {});
           return true;
         } catch (copyErr) {
+          if (item.caption_overridden) return false;
           const { accountController } = require('../../userAccount');
           const healed = await accountController.forwardByPermanentIds(chatId, item.source_chat_id, [item.source_msg_id]);
           if (healed.success) {
+            if (record && healed.messageIds?.length) await record(healed.messageIds.map((id: number) => ({ message_id: id })));
             refreshFileIdFromVault(ctx.telegram, item, database).catch(() => {});
           }
           return healed.success;
@@ -423,25 +482,32 @@ export class SearchHandler {
     try {
       switch (item.file_type) {
         case 'photo':
-          await ctx.replyWithPhoto(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithPhoto(item.file_id, { caption })]); }
+          else { await ctx.replyWithPhoto(item.file_id, { caption }); }
           break;
         case 'video':
-          await ctx.replyWithVideo(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithVideo(item.file_id, { caption })]); }
+          else { await ctx.replyWithVideo(item.file_id, { caption }); }
           break;
         case 'document':
-          await ctx.replyWithDocument(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithDocument(item.file_id, { caption })]); }
+          else { await ctx.replyWithDocument(item.file_id, { caption }); }
           break;
         case 'audio':
-          await ctx.replyWithAudio(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithAudio(item.file_id, { caption })]); }
+          else { await ctx.replyWithAudio(item.file_id, { caption }); }
           break;
         case 'voice':
-          await ctx.replyWithVoice(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithVoice(item.file_id, { caption })]); }
+          else { await ctx.replyWithVoice(item.file_id, { caption }); }
           break;
         case 'animation':
-          await ctx.replyWithAnimation(item.file_id, { caption });
+          if (record) { await record([await ctx.replyWithAnimation(item.file_id, { caption })]); }
+          else { await ctx.replyWithAnimation(item.file_id, { caption }); }
           break;
         case 'video_note':
-          await ctx.replyWithVideoNote(item.file_id);
+          if (record) { await record([await ctx.replyWithVideoNote(item.file_id)]); }
+          else { await ctx.replyWithVideoNote(item.file_id); }
           break;
       }
     } catch (error: any) {

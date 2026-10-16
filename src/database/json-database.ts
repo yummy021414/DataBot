@@ -30,6 +30,7 @@ interface DatabaseData {
   albums?: { [albumId: string]: any }; // 新增：存储生成的相册数据
   recommendedTags?: string[]; // 新增：推荐标签
   chatMessages?: ChatMessageRecord[];
+  searchReplyGroups?: { [key: string]: Array<Pick<MediaItem, 'id' | 'keyword' | 'uploaded_by' | 'uploaded_at' | 'batchId'>> };
 }
 
 export class JsonDatabase {
@@ -46,7 +47,7 @@ export class JsonDatabase {
     // 使用 path.join 和 __dirname 确保数据库路径是相对于项目根目录的绝对路径
     const projectRoot = path.join(__dirname, '..', '..');
     // 如果是绝对路径，直接使用；否则拼接到项目根目录
-    if (config.databasePath.startsWith('/')) {
+    if (path.isAbsolute(config.databasePath)) {
       this.dataPath = config.databasePath.replace('.db', '.json');
     } else {
       this.dataPath = path.join(projectRoot, config.databasePath.replace('.db', '.json'));
@@ -72,6 +73,7 @@ export class JsonDatabase {
         // 兼容旧数据：如果没有users字段，初始化为空数组
         this.data = {
           media: loadedData.media || [],
+          searchReplyGroups: this.normalizeObjectMap(loadedData.searchReplyGroups),
           userPermissions: loadedData.userPermissions || [],
           userSessions: this.normalizeObjectMap(loadedData.userSessions),
           users: loadedData.users || [],
@@ -168,14 +170,17 @@ export class JsonDatabase {
   }
 
   private saveTimer: NodeJS.Timeout | null = null;
+  /** 所有 JSON 落盘串行执行，避免多个异步任务同时覆盖同一个 .tmp 文件。 */
+  private persistQueue: Promise<void> = Promise.resolve();
 
-  /** 只序列化白名单字段；sessions 不落盘（易含大对象）；albums/sessions 强制为普通对象 */
+  /** 白名单序列化；仅持久化上传会话中的原始值，排除 Context/计时器。 */
   private serializeData(): string {
     const albums = this.normalizeObjectMap(this.data.albums);
     const payload = {
       media: this.data.media || [],
+      searchReplyGroups: this.data.searchReplyGroups || {},
       userPermissions: this.data.userPermissions || [],
-      userSessions: {}, // 上传会话不持久化，避免 Contet/大数组把 JSON 撑爆
+      userSessions: this.uploadSessionSnapshots(),
       users: this.data.users || [],
       joinWelcomeConfig: this.data.joinWelcomeConfig,
       channels: Array.isArray(this.data.channels) ? this.data.channels : [],
@@ -186,17 +191,41 @@ export class JsonDatabase {
     return JSON.stringify(payload);
   }
 
+  /** Persist only primitive upload fields; never serialize Context or timers. */
+  private uploadSessionSnapshots(): Record<string, any> {
+    const output: Record<string, any> = {};
+    const fields = ['userId', 'mode', 'step', 'currentKeyword', 'selectedChannel', 'pendingText', 'expiresAt'];
+    for (const [uid, session] of Object.entries(this.data.userSessions)) {
+      if (!session || !['upload', 'add_review'].includes(session.mode)) continue;
+      const snapshot: any = {};
+      for (const key of fields) if (['string', 'number', 'boolean'].includes(typeof session[key])) snapshot[key] = session[key];
+      snapshot.selectedChannels = (session.selectedChannels || []).filter((v: any) => typeof v === 'string');
+      snapshot.pendingMedia = (session.pendingMedia || []).map((media: any) =>
+        Object.fromEntries(Object.entries(media).filter(([_, value]) => ['string', 'number', 'boolean'].includes(typeof value))));
+      output[uid] = snapshot;
+    }
+    return output;
+  }
+
   private saveData(): void {
     if (this.saveTimer) {
       clearTimeout(this.saveTimer);
     }
 
     this.saveTimer = setTimeout(() => {
-      this.persistToDisk().catch(() => {});
+      this.saveTimer = null;
+      void this.enqueuePersist(false);
     }, 500);
   }
 
-  private async persistToDisk(): Promise<void> {
+  private enqueuePersist(throwOnError: boolean): Promise<void> {
+    const operation = this.persistQueue.then(() => this.persistToDisk(throwOnError));
+    // 队列本身保持可继续；调用方仍会收到本次 operation 的异常。
+    this.persistQueue = operation.catch(() => {});
+    return operation;
+  }
+
+  private async persistToDisk(throwOnError = false): Promise<void> {
     try {
       // 运行时也纠正：若被写成了数组，立刻改回对象，否则下一次还会炸
       this.data.userSessions = this.normalizeObjectMap(this.data.userSessions);
@@ -206,7 +235,6 @@ export class JsonDatabase {
       const tmp = `${this.dataPath}.tmp`;
       await fs.promises.writeFile(tmp, payload, 'utf8');
       await fs.promises.rename(tmp, this.dataPath);
-      this.saveTimer = null;
     } catch (error: any) {
       console.error('❌ JSON数据库异步保存失败:', error?.message || error);
       console.error(
@@ -219,6 +247,7 @@ export class JsonDatabase {
       } catch (e2: any) {
         console.error('   media-fallback 也失败:', e2?.message || e2);
       }
+      if (throwOnError) throw error;
     }
   }
 
@@ -227,24 +256,15 @@ export class JsonDatabase {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
-    try {
-      this.data.userSessions = this.normalizeObjectMap(this.data.userSessions);
-      this.data.albums = this.normalizeObjectMap(this.data.albums);
-      const payload = this.serializeData();
-      const tmp = `${this.dataPath}.tmp`;
-      fs.writeFileSync(tmp, payload, 'utf8');
-      fs.renameSync(tmp, this.dataPath);
-    } catch (error: any) {
-      console.error('❌ JSON数据库立即保存失败:', error?.message || error);
-      try {
-        const mediaOnly = JSON.stringify({ media: this.data.media || [], savedAt: new Date().toISOString() });
-        fs.writeFileSync(this.dataPath.replace(/\.json$/i, '.media-fallback.json'), mediaOnly, 'utf8');
-      } catch {}
-    }
+    await this.enqueuePersist(true);
   }
 
   // 媒体相关方法
   async saveMedia(mediaItem: Omit<MediaItem, 'id'>): Promise<number> {
+    if (mediaItem.upload_key) {
+      const existing = this.data.media.find(m => m.upload_key === mediaItem.upload_key);
+      if (existing) return existing.id;
+    }
     const newId = this.data.media.length > 0 ? Math.max(...this.data.media.map(m => m.id)) + 1 : 1;
     const item: MediaItem = {
       ...mediaItem,
@@ -534,6 +554,60 @@ export class JsonDatabase {
     }
   }
 
+  /**
+   * 原子切换为带水印版本。首次迁移时保留旧 file_id/金库坐标；每条立即落盘，
+   * 因而批量任务被重启或暂停后可以安全续跑，不会重复处理已完成资料。
+   */
+  async updateMediaWatermark(
+    id: number,
+    update: {
+      fileId: string;
+      version: number;
+      sourceChatId: string;
+      sourceMsgId: number;
+      expectedFileId?: string;
+    }
+  ): Promise<void> {
+    return this.updateMediaWatermarkBatch([{ id, ...update }]);
+  }
+
+  /** Commit the whole album in one durable write; never leave half an album switched. */
+  async updateMediaWatermarkBatch(updates: Array<{
+    id: number; fileId: string; version: number; sourceChatId: string; sourceMsgId: number; expectedFileId?: string;
+  }>): Promise<void> {
+    const entries = updates.map(update => {
+      const item = this.data.media.find(m => m.id === update.id);
+      if (!item) throw new Error('媒体 #' + update.id + ' 不存在');
+      if (update.expectedFileId && item.file_id !== update.expectedFileId)
+        throw new Error('资料处理期间发生变化，本次不覆盖，请重试');
+      return { update, item, before: { ...item } };
+    });
+    for (const { update, item, before } of entries) {
+      if (!item.original_file_id) item.original_file_id = item.file_id;
+      if (!before.watermarked && !item.original_source_chat_id && item.source_chat_id)
+        item.original_source_chat_id = item.source_chat_id;
+      if (!before.watermarked && !item.original_source_msg_id && item.source_msg_id)
+        item.original_source_msg_id = item.source_msg_id;
+      item.file_id = update.fileId;
+      item.source_chat_id = update.sourceChatId;
+      item.source_msg_id = update.sourceMsgId;
+      item.watermarked = true;
+      item.watermark_version = update.version;
+      item.watermarked_at = new Date().toISOString();
+    }
+    try { await this.saveImmediately(); }
+    catch (error) {
+      for (const { item, before } of entries) {
+        for (const key of ['file_id', 'source_chat_id', 'source_msg_id', 'watermarked', 'watermark_version',
+          'watermarked_at', 'original_file_id', 'original_source_chat_id', 'original_source_msg_id']) {
+          if (Object.prototype.hasOwnProperty.call(before, key)) (item as any)[key] = (before as any)[key];
+          else delete (item as any)[key];
+        }
+      }
+      throw error;
+    }
+  }
+
   /** 批量更新 file_id，只落盘一次 */
   async batchUpdateMediaFileIds(
     updates: Array<{ id: number; fileId: string; fileType?: MediaItem['file_type'] }>
@@ -737,6 +811,84 @@ export class JsonDatabase {
   async deleteMedia(id: number): Promise<void> {
     this.data.media = this.data.media.filter(item => item.id !== id);
     this.saveData();
+  }
+
+  async rememberSearchGroup(chatId: number, messageIds: number[], items: MediaItem[]): Promise<void> {
+    const refs = items.map(({ id, keyword, uploaded_by, uploaded_at, batchId }) =>
+      ({ id, keyword, uploaded_by, uploaded_at, batchId }));
+    this.data.searchReplyGroups ||= {};
+    for (const id of messageIds) this.data.searchReplyGroups[`${chatId}:${id}`] = refs;
+    await this.saveImmediately();
+  }
+
+  getSearchGroup(chatId: number, messageId: number, userId?: number): MediaItem[] {
+    const refs = this.data.searchReplyGroups?.[`${chatId}:${messageId}`];
+    if (!refs?.length) throw new Error('找不到对应资料组，请重新搜索后引用。');
+    const items = this.data.media.filter(item => !item.is_review && refs.some(ref =>
+      item.id === ref.id && item.keyword === ref.keyword && item.uploaded_by === ref.uploaded_by &&
+      item.uploaded_at === ref.uploaded_at && item.batchId === ref.batchId));
+    if (!items.length) throw new Error('这组资料已经删除，请重新搜索。');
+    if (userId !== undefined && items.some(item => item.uploaded_by !== userId)) throw new Error('只能修改自己的资料。');
+    return items.map(item => ({ ...item }));
+  }
+
+  async replaceSearchGroup(chatId: number, messageId: number, userId: number | undefined,
+    expected: MediaItem[], replacement: MediaItem[]): Promise<void> {
+    const current = this.getSearchGroup(chatId, messageId, userId);
+    if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error('资料已发生变化，请重新引用并替换。');
+    if (!replacement.length || replacement.some(item => item.keyword !== current[0].keyword ||
+      item.uploaded_by !== current[0].uploaded_by || item.batchId !== current[0].batchId || item.is_review)) {
+      throw new Error('替换资料组不一致');
+    }
+    const ids = new Set(current.map(item => item.id));
+    let nextId = Math.max(0, ...this.data.media.map(item => item.id)) + 1;
+    const saved = replacement.map(item => ({ ...item, id: nextId++, caption_overridden: true }));
+    const oldRefs = this.data.searchReplyGroups;
+    const updatedRefs = { ...oldRefs };
+    const refs = saved.map(({ id, keyword, uploaded_by, uploaded_at, batchId }) =>
+      ({ id, keyword, uploaded_by, uploaded_at, batchId }));
+    for (const [key, value] of Object.entries(updatedRefs)) {
+      if (value.some(ref => current.some(item => item.id === ref.id && item.uploaded_at === ref.uploaded_at &&
+        item.keyword === ref.keyword && item.uploaded_by === ref.uploaded_by && item.batchId === ref.batchId))) updatedRefs[key] = refs;
+    }
+    this.data.media = this.data.media.filter(item => !ids.has(item.id)).concat(saved);
+    this.data.searchReplyGroups = updatedRefs;
+    try { await this.saveImmediately(); }
+    catch (error) {
+      const savedIds = new Set(saved.map(item => item.id));
+      this.data.media = this.data.media.filter(item => !savedIds.has(item.id)).concat(current);
+      this.data.searchReplyGroups = oldRefs;
+      throw error;
+    }
+  }
+
+  async deleteSearchGroup(chatId: number, messageId: number, userId?: number): Promise<{
+    status: 'missing' | 'forbidden' | 'deleted'; keyword?: string; count?: number; remainingGroups?: number;
+  }> {
+    const refs = this.data.searchReplyGroups?.[`${chatId}:${messageId}`];
+    if (!refs?.length) return { status: 'missing' };
+    // IDs can be reused after deletion, so also verify the original group identity.
+    const matches = (item: MediaItem) => !item.is_review && refs.some(ref =>
+      item.id === ref.id && item.keyword === ref.keyword && item.uploaded_by === ref.uploaded_by &&
+      item.uploaded_at === ref.uploaded_at && item.batchId === ref.batchId);
+    const targets = this.data.media.filter(matches);
+    if (!targets.length) return { status: 'missing' };
+    if (userId !== undefined && targets.some(item => item.uploaded_by !== userId)) {
+      return { status: 'forbidden' };
+    }
+    const keyword = refs[0].keyword;
+    const previous = this.data.media;
+    this.data.media = previous.filter(item => !matches(item));
+    try {
+      await this.saveImmediately();
+    } catch (error) {
+      this.data.media.push(...targets);
+      throw error;
+    }
+    const remaining = this.data.media.filter(item => !item.is_review && item.keyword === keyword &&
+      (userId === undefined || item.uploaded_by === userId));
+    return { status: 'deleted', keyword, count: targets.length,
+      remainingGroups: new Set(remaining.map(item => `${item.uploaded_by}:${item.batchId || 'default'}`)).size };
   }
 
   async getMediaCount(userId?: number): Promise<number> {

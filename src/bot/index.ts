@@ -4,8 +4,10 @@ import { config, BUTTONS, authorizedUsers, getAdminChannelIds, hasAdminChannelMa
 import { BotMode, UserSession } from '../types';
 import { database } from '../database';
 import { SearchHandler } from './handlers/SearchHandler';
+import { ReplaceGroupHandler } from './handlers/ReplaceGroupHandler';
 import { UploadHandler } from './handlers/UploadHandler';
 import { PublishHandler } from './handlers/PublishHandler';
+import { scheduledPublish } from '../services/scheduledPublish';
 import { JoinWelcomeHandler } from './handlers/JoinWelcomeHandler';
 import { DirectSendHandler } from './handlers/DirectSendHandler';
 import { AlbumHandler } from './handlers/AlbumHandler';
@@ -14,6 +16,7 @@ import { TagFilterHandler } from './handlers/TagFilterHandler';
 import { ForwardingService } from '../forwarding';
 import { BroadcastDataHandler } from './handlers/BroadcastDataHandler';
 import { ReviewHandler } from './handlers/ReviewHandler';
+import { WatermarkHandler } from './handlers/WatermarkHandler';
 import { getVaultCoverageStats, checkVaultAccess } from '../services/vault';
 
 export class TelegramBot {
@@ -135,12 +138,54 @@ export class TelegramBot {
         this.broadcastContent = null;
     this.bot = bot;
     this.forwardingService = forwardingService;
+    // Preserve the production guard: only admins may interact in group chats.
+    this.bot.use(async (ctx, next) => {
+      const isGroup = ctx.chat?.type === 'group' || ctx.chat?.type === 'supergroup';
+      if (isGroup && (ctx.message || ctx.callbackQuery)) {
+        const uid = ctx.from?.id;
+        let allowed = Boolean(uid && this.isAdmin(uid));
+        if (!allowed && uid && ctx.chat) {
+          try {
+            const member = await ctx.telegram.getChatMember(ctx.chat.id, uid);
+            allowed = ['creator', 'administrator'].includes(member.status);
+          } catch { allowed = false; }
+        }
+        if (!allowed) return;
+      }
+      return next();
+    });
     this.setupHandlers();
   }
     getBot() {
     return this.bot;
   }
     setupHandlers() {
+    // Navigation must precede every mode-specific input consumer.
+    this.bot.use(async (ctx, next) => {
+      const text = ctx.message && 'text' in ctx.message ? ctx.message.text.trim() : '';
+      const action = ctx.callbackQuery && 'data' in ctx.callbackQuery ? ctx.callbackQuery.data : '';
+      if ((action && !action.startsWith('replace_group:')) ||
+          ['⬅️ 返回主菜单', '🏠 返回主菜单', '返回主菜单', '主菜单', '/start', '❌ 取消', '取消', '/cancel'].includes(text)) {
+        if (!await ReplaceGroupHandler.cancelForNavigation(ctx)) return;
+      }
+      if (action === 'back_to_main' || ['⬅️ 返回主菜单', '🏠 返回主菜单', '返回主菜单', '主菜单', '/start'].includes(text)) {
+        await this.handleBackToMain(ctx); return;
+      }
+      if (action === 'cancel' || ['❌ 取消', '取消', '/cancel'].includes(text)) {
+        await this.handleCancel(ctx); return;
+      }
+      return next();
+    });
+    // While this uploader's background save is active, preserve its frozen session.
+    // Other users continue normally; the handler itself returns immediately.
+    this.bot.use(async (ctx, next) => {
+      if (ctx.from && UploadHandler.isProcessing(ctx.from.id)) {
+        if (ctx.callbackQuery) await ctx.answerCbQuery('当前上传正在处理，请完成后再操作').catch(() => {});
+        else await ctx.reply('当前上传正在后台处理，请完成后再发送新资料或切换模式。').catch(() => {});
+        return;
+      }
+      return next();
+    });
     // 基础命令
     this.bot.start(this.withAuthorization(this.handleStart.bind(this)));
     this.bot.help(this.withAuthorization(this.handleHelp.bind(this)));
@@ -153,6 +198,12 @@ export class TelegramBot {
     this.bot.command('setforwarddelay', this.withAuthorization(this.handleSetForwardDelay.bind(this)));
     this.bot.command('showforwarddelay', this.withAuthorization(this.handleShowForwardDelay.bind(this)));
     this.bot.command('vaultstatus', this.withStrictAuthorization(this.handleVaultStatus.bind(this)));
+    this.bot.command('watermark', this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleMenu(ctx, database);
+    }));
+    this.bot.hears('🛡️ 水印管理', this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleMenu(ctx, database);
+    }));
     // ========== 账号控制功能（新增） ==========
     this.bot.command('account', this.withStrictAuthorization(this.handleAccountMenu.bind(this)));
     this.bot.hears('🎛️ 账号控制', this.withStrictAuthorization(this.handleAccountMenu.bind(this)));
@@ -245,6 +296,18 @@ export class TelegramBot {
     this.bot.action('browse_keywords', this.handleBrowseKeywords.bind(this));
     this.bot.action('delete_keyword', this.handleDeleteKeyword.bind(this));
     this.bot.action('clean_data', this.handleCleanData.bind(this));
+    this.bot.action('watermark_menu', this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleMenu(ctx, database);
+    }));
+    this.bot.action('watermark_confirm', this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleConfirm(ctx, database);
+    }));
+    this.bot.action(/^watermark_start(?::[a-f0-9]+)?$/, this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleStart(ctx, database);
+    }));
+    this.bot.action('watermark_stop', this.withStrictAuthorization(async (ctx) => {
+      await WatermarkHandler.handleStop(ctx);
+    }));
     this.bot.action('start_review', this.withAuthorization(async (ctx) => {
       await ReviewHandler.handleStart(ctx, database);
     }));
@@ -299,7 +362,7 @@ export class TelegramBot {
     this.bot.action('confirm_broadcast', this.handleConfirmBroadcast.bind(this));
     this.bot.action('cancel_broadcast', this.handleCancelBroadcast.bind(this));
     this.bot.action('start_search', this.handleStartSearch.bind(this));
-    this.bot.action('start_upload', this.handleStartUpload.bind(this));
+    this.bot.action('start_upload', this.withStrictAuthorization(this.handleStartUpload.bind(this)));
     this.bot.action('start_publish', this.handleStartPublish.bind(this));
     this.bot.action('start_keywords', this.handleStartKeywords.bind(this));
     this.bot.action('start_help', this.handleStartHelp.bind(this));
@@ -322,6 +385,12 @@ export class TelegramBot {
     this.bot.action('help_chat', this.handleHelpChat.bind(this));
     this.bot.action('help_faq', this.handleHelpFAQ.bind(this));
     this.bot.action('help_back', this.handleHelpBack.bind(this));
+    this.bot.action(/^replace_group:/, ctx => ReplaceGroupHandler.handleCallback(ctx, database));
+    this.bot.on('message', async (ctx, next) => {
+      if (await SearchHandler.handleReplyDelete(ctx, database)) return;
+      if (await ReplaceGroupHandler.handleMessage(ctx, database)) return;
+      return next();
+    });
     // 文本消息处理
         
         // 按钮制作回调
@@ -334,6 +403,7 @@ export class TelegramBot {
     // 频道选择
     this.bot.action(/^publish_toggle_/, this.handlePublishChannelToggle.bind(this));
     this.bot.action('publish_channels_confirm', this.handlePublishChannelsConfirm.bind(this));
+    this.bot.action(/^schedule_/, (ctx) => PublishHandler.scheduleAction(ctx, this.userSessions, database));
     this.bot.action(/^upload_toggle_/, this.handleUploadChannelToggle.bind(this));
     this.bot.action('upload_channels_confirm', this.handleUploadChannelsConfirm.bind(this));
     this.bot.action(/^channel_/, this.handleChannelSelect.bind(this));
@@ -483,7 +553,6 @@ export class TelegramBot {
             welcomeMessage += `👤 用户功能\n\n`;
             welcomeMessage += `📋 可用功能：\n`;
             welcomeMessage += `• 🔍 搜索资料 - 快速查找资料\n`;
-            welcomeMessage += `• 📁 上传资料 - 批量上传照片、视频\n`;
             welcomeMessage += `• 📄 查看资料 - 浏览和管理资料\n`;
             welcomeMessage += `• 🖼️ 网页相册 - 制作网页相册链接\n`;
             welcomeMessage += `• 💬 联系管理员 - 随时联系管理员\n\n`;
@@ -529,7 +598,6 @@ export class TelegramBot {
             // 普通用户：第一行 - 核心功能
       inlineKeyboard.push([
                 Markup.button.callback('🔍 搜索资料', 'start_search'),
-                Markup.button.callback('📁 上传资料', 'start_upload'),
                 Markup.button.callback('📄 查看资料', 'start_keywords')
       ]);
             // 第二行 - 其他功能
@@ -588,8 +656,7 @@ export class TelegramBot {
     const userId = ctx.from?.id;
         if (!userId)
             return;
-    // 会员制度已取消，上传功能对所有用户开放
-    // 设置用户为上传模式
+    // 设置管理员为上传模式
     if (this.isAdmin(userId)) userAccountCommands.silentCleanup(userId);
         const session = {
       userId,
@@ -763,6 +830,7 @@ export class TelegramBot {
           `• 尝试使用 [🏷️ 标签筛选] 查找包含特定标志的文案`, 
           Markup.inlineKeyboard([
             [Markup.button.callback('🏷️ 标签筛选', 'start_tag_filter')],
+            ...(isAdmin ? [[Markup.button.callback('🛡️ 水印管理', 'watermark_menu')]] : []),
             [Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]
           ]));
         return;
@@ -827,9 +895,8 @@ export class TelegramBot {
         }
         else {
       helpMessage += `👤 用户使用指南\n\n`;
-      helpMessage += `🎯 功能已全开，可直接使用\n`;
+      helpMessage += `🎯 可直接使用以下功能\n`;
       helpMessage += `• 🔍 搜索资料\n`;
-      helpMessage += `• 📁 上传资料\n`;
       helpMessage += `• 🖼️ 网页相册（单次最多20组，3天后自动清除）\n`;
       helpMessage += `• 📚 浏览资料\n`;
       helpMessage += `• 💬 联系管理员获取帮助\n\n`;
@@ -842,10 +909,12 @@ export class TelegramBot {
       Markup.button.callback('📚 资料浏览', 'help_keywords'),
       Markup.button.callback('💬 联系客服', 'help_chat')
     ]);
-    helpKeyboard.push([
-      Markup.button.callback('📁 上传管理', 'help_upload'),
-      Markup.button.callback('🚀 内容发布', 'help_publish')
-    ]);
+    if (isAdmin) {
+      helpKeyboard.push([
+        Markup.button.callback('📁 上传管理', 'help_upload'),
+        Markup.button.callback('🚀 内容发布', 'help_publish')
+      ]);
+    }
     // 第二行：管理员功能帮助（仅管理员）
     if (isAdmin) {
       helpKeyboard.push([
@@ -865,7 +934,7 @@ export class TelegramBot {
       helpMessage += `📋 包含数据管理、用户管理、权限控制等\n\n`;
         }
         else {
-      helpMessage += `✅ **功能已全开** - 可使用搜索、上传、查看资料、网页相册等\n\n`;
+      helpMessage += `✅ 可使用搜索、查看资料、网页相册等功能\n\n`;
     }
     helpMessage += `点击下方按钮获取详细使用指南：`;
     // 移除冗长的功能描述列表，让按钮标签更直观
@@ -1185,10 +1254,13 @@ export class TelegramBot {
     await ctx.editMessageText(message, await this.getModeKeyboard(mode));
   }
     async handleBackToMain(ctx: Context) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
     const userId = ctx.from?.id;
         if (!userId)
             return;
     this.userSessions.delete(userId);
+    userAccountCommands.silentCleanup(userId);
+    WatermarkHandler.clearInput(userId);
     await database.clearUserSession(userId);
         await ctx.reply('🤖 频道管理机器人\n\n请选择功能：', await this.getCoreFunctionKeyboard(userId));
   }
@@ -1274,6 +1346,7 @@ export class TelegramBot {
         `• 或多个空格：优米 樊樊 北北\n` +
         `会按顺序同步发到所有已选目标。\n\n` +
         `🔄 发布模式将保持激活，可连续发布`, Markup.inlineKeyboard([
+          ...(isAdminUser(userId) ? [[Markup.button.callback('⏰ 定时发送', 'schedule_begin'), Markup.button.callback('📋 定时任务', 'schedule_list')], [Markup.button.callback('立即发送', 'schedule_immediate')]] : []),
           [Markup.button.callback('❌ 退出发布模式', 'cancel')]
         ])).catch(async () => {
           await ctx.reply('✅ 目标已确认，请直接输入要发布的关键词。');
@@ -1437,10 +1510,13 @@ export class TelegramBot {
         await ctx.editMessageText(`📷 单文件上传模式已激活\n\n请输入关键词：`, this.getBackKeyboard());
   }
     async handleCancel(ctx: Context) {
+    if (ctx.callbackQuery) await ctx.answerCbQuery().catch(() => {});
     const userId = ctx.from?.id;
         if (!userId)
             return;
     this.userSessions.delete(userId);
+    userAccountCommands.silentCleanup(userId);
+    WatermarkHandler.clearInput(userId);
     await database.clearUserSession(userId);
         await ctx.reply('❌ 操作已取消\n\n请选择功能：', await this.getCoreFunctionKeyboard(userId));
   }
@@ -1451,6 +1527,7 @@ export class TelegramBot {
 
         const text = ctx.message && 'text' in ctx.message ? ctx.message.text : undefined;
         if (!text) return;
+        if (await WatermarkHandler.handleKeywordInput(ctx, database)) return;
 
         // 🚀 增加全量日志，确保能看到每一条进来的消息
         const userDisplay = this.getUserDisplay(ctx);
@@ -2249,21 +2326,21 @@ export class TelegramBot {
       return Markup.keyboard([
                 ['🖼️ 网页相册', BUTTONS.UPLOAD_DATA, BUTTONS.VIEW_DATA],
                 [BUTTONS.PUBLISH_CONTENT, BUTTONS.CHANNEL_MANAGE],
-        [BUTTONS.BROADCAST_MESSAGE, '🎛️ 账号控制', BUTTONS.CHAT_WITH_ADMIN]
+        [BUTTONS.BROADCAST_MESSAGE, '🎛️ 账号控制', BUTTONS.CHAT_WITH_ADMIN],
       ]).resize();
         }
         else if (isAdmin) {
       // 👑 子管理员键盘 - 独立资料功能（不含全局管理）
       return Markup.keyboard([
                 ['🖼️ 网页相册', BUTTONS.UPLOAD_DATA, BUTTONS.VIEW_DATA],
-                [BUTTONS.PUBLISH_CONTENT, BUTTONS.CHAT_WITH_ADMIN]
+                [BUTTONS.PUBLISH_CONTENT, BUTTONS.CHAT_WITH_ADMIN],
       ]).resize();
         }
         else {
-      // 👤 普通用户键盘（会员制度已取消，功能全开）
+      // 👤 普通用户键盘
       return Markup.keyboard([
-                ['🖼️ 网页相册', BUTTONS.UPLOAD_DATA, BUTTONS.VIEW_DATA],
-                [BUTTONS.CHAT_WITH_ADMIN]
+                ['🖼️ 网页相册', BUTTONS.VIEW_DATA],
+                [BUTTONS.CHAT_WITH_ADMIN],
       ]).resize();
     }
   }
@@ -2343,6 +2420,7 @@ export class TelegramBot {
         if (selected.size > 0) {
           buttons.push([Markup.button.callback(`✅ 确认 ${selected.size} 个目标`, 'publish_channels_confirm')]);
         }
+        if (isAdminUser(userId)) buttons.push([Markup.button.callback('📋 定时任务', 'schedule_list')]);
         buttons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
         return Markup.inlineKeyboard(buttons);
   }
@@ -2782,6 +2860,9 @@ export class TelegramBot {
       Markup.button.callback('🏷️ 标签筛选', 'start_tag_filter')
     ]);
     // 添加返回按钮
+    if (ctx.from?.id && this.isAdmin(ctx.from.id)) {
+      navigationButtons.push([Markup.button.callback('🛡️ 水印管理', 'watermark_menu')]);
+    }
     navigationButtons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
     const allButtons = [...keywordButtons, ...navigationButtons];
         const text = `🔍 关键词列表 (第 ${page + 1}/${totalPages} 页)\n\n` +
@@ -3719,6 +3800,7 @@ export class TelegramBot {
   }
     async start() {
     try {
+      scheduledPublish.start(this.bot);
       console.log('[启动] 步骤1: 开始启动bot...');
       console.log('[启动] Bot Token长度:', config.botToken?.length || 0);
       console.log('[启动] 域名配置:', process.env.DOMAIN || '未配置 (将使用localhost)');

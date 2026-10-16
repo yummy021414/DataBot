@@ -38,9 +38,10 @@ fi
 # 安装必要的系统依赖
 echo "📦 安装系统依赖..."
 if [ "$PACKAGE_MANAGER" = "apt-get" ]; then
-    sudo apt-get install -y curl wget git build-essential python3 python3-pip
+    sudo apt-get install -y curl wget git build-essential python3 python3-pip ffmpeg fonts-noto-cjk
 elif [ "$PACKAGE_MANAGER" = "yum" ] || [ "$PACKAGE_MANAGER" = "dnf" ]; then
     sudo $PACKAGE_MANAGER install -y curl wget git gcc gcc-c++ make python3 python3-pip
+    echo '启用水印前，请按发行版安装 FFmpeg (drawtext/libx264) 和 Noto CJK 字体，并配置 WATERMARK_FONT_FILE。'
 fi
 
 # 检查Node.js是否已安装

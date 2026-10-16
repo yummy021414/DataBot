@@ -17,6 +17,35 @@ export const config: BotConfig = {
   persistentGroupId: process.env.PERSISTENT_GROUP_ID
 };
 
+const parseBoolean = (value: string | undefined, fallback = false): boolean => {
+  if (value == null || value.trim() === '') return fallback;
+  return ['1', 'true', 'yes', 'on'].includes(value.trim().toLowerCase());
+};
+
+const parseNumber = (value: string | undefined, fallback: number, min: number, max: number): number => {
+  if (value == null || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+};
+
+/** 媒体水印配置。默认关闭，避免未配置文案时意外改写已有资料。 */
+export const watermarkConfig = {
+  enabled: parseBoolean(process.env.WATERMARK_ENABLED, false),
+  text: (process.env.WATERMARK_TEXT || '').trim(),
+  ffmpegPath: (process.env.FFMPEG_PATH || 'ffmpeg').trim(),
+  fontFile: (process.env.WATERMARK_FONT_FILE || '').trim(),
+  tempDir: (process.env.WATERMARK_TEMP_DIR || '').trim(),
+  maxInputMb: parseNumber(process.env.WATERMARK_MAX_INPUT_MB, 2000, 20, 2000),
+  opacity: parseNumber(process.env.WATERMARK_OPACITY, 0.35, 0.05, 1),
+  videoPeriodSeconds: parseNumber(process.env.WATERMARK_VIDEO_PERIOD_SECONDS, 8, 2, 60),
+  videoCrf: Math.round(parseNumber(process.env.WATERMARK_VIDEO_CRF, 23, 16, 35)),
+  videoPreset: (process.env.WATERMARK_VIDEO_PRESET || 'veryfast').trim(),
+  ffmpegThreads: Math.round(parseNumber(process.env.WATERMARK_FFMPEG_THREADS, 1, 1, 8)),
+  jobTimeoutSeconds: Math.round(parseNumber(process.env.WATERMARK_JOB_TIMEOUT_SECONDS, 3600, 60, 21600)),
+  version: Math.round(parseNumber(process.env.WATERMARK_VERSION, 1, 1, 9999))
+};
+
 if (!config.botToken) {
   console.warn('⚠️ 未配置 BOT_TOKEN，请在 .env 中填写后再启动');
 }

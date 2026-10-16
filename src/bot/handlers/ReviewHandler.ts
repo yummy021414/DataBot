@@ -145,6 +145,6 @@ export class ReviewHandler {
       console.log(`[好评库] 状态已更新: step=waiting_media, keyword=${text}`);
     }
 
-    await ctx.reply(`✅ 已关联关键词: <b>${text}</b>\n\n现在请发送该关键词对应的<b>好评图片/视频</b>：`, { parse_mode: 'HTML' });
+    await ctx.reply(`✅ 已关联关键词: <b>${text}</b>\n\n现在请发送该关键词对应的<b>好评图片/视频</b>：\n\n好评图片保存时自动添加水印，视频保持原版。`, { parse_mode: 'HTML' });
   }
 }

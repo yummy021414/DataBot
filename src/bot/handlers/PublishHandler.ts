@@ -4,8 +4,75 @@ import { UserSession } from '../../types';
 import { config, isAdminUser, isSuperAdmin } from '../../config';
 import { recordPublishEvent } from '../../services/publishAudit';
 import { SearchHandler } from './SearchHandler';
+import { scheduledPublish, parsePublishTime, publishTimeLabel } from '../../services/scheduledPublish';
 
 export class PublishHandler {
+  private static homeButtons = { reply_markup: { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] } };
+  private static creatingSchedules = new Set<number>();
+  static async scheduleAction(ctx: Context, sessions: Map<number, UserSession>, db: typeof database): Promise<void> {
+    const uid = ctx.from?.id;
+    if (!uid || !isAdminUser(uid)) { await ctx.answerCbQuery('仅管理员可用'); return; }
+    const action = (ctx.callbackQuery as any)?.data as string;
+    await ctx.answerCbQuery().catch(() => {});
+    if (action === 'schedule_list' || action.startsWith('schedule_cancel_')) {
+      if (action.startsWith('schedule_cancel_')) scheduledPublish.cancel(uid, action.slice('schedule_cancel_'.length));
+      const jobs = scheduledPublish.list(uid);
+      const labels = { queued: '等待发送', running: '发送中', complete: '完成', cancelled: '已取消', attention: '需核对' };
+      await ctx.reply(jobs.length ? jobs.map(j => `${j.id} · ${labels[j.status]} · ${publishTimeLabel(j.at)}\n关键词：${j.keywords.join('、')}\n目标：${j.channels.join('、')}\n进度：${j.cursor}/${j.units.length}${j.error ? '\n原因：' + j.error : ''}`).join('\n\n').slice(0, 3900) : '暂无定时任务', {
+        reply_markup: { inline_keyboard: [...jobs.filter(j => ['queued', 'attention'].includes(j.status)).map(j => [{ text: `取消 ${j.id}`, callback_data: `schedule_cancel_${j.id}` }]), [{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] }
+      }); return;
+    }
+    const session: any = sessions.get(uid) || await db.getUserSession(uid);
+    if (!session || session.mode !== 'publish' || !this.getSelectedChannels(session).length) { await ctx.reply('请先进入发布模式并确认目标频道。'); return; }
+    if (action === 'schedule_begin') {
+      session.step = 'waiting_keyword';
+      session.scheduleStage = 'time'; session.scheduleAt = undefined; session.scheduleKeywords = undefined;
+      await ctx.reply('⏰ 请输入开始时间（北京时间）：\n18:00 或 2026-09-24 18:00\n只输入时分且今天已过，会设为明天。到点开始按队列依次发送。', this.homeButtons);
+    } else if (action === 'schedule_immediate') {
+      session.step = 'waiting_keyword';
+      delete session.scheduleStage; delete session.scheduleAt; delete session.scheduleKeywords;
+      await ctx.reply('已切换为立即发布，请输入关键词。', this.homeButtons);
+    } else if (action === 'schedule_confirm' && session.scheduleStage === 'confirm') {
+      if (this.creatingSchedules.has(uid)) return;
+      this.creatingSchedules.add(uid);
+      try {
+        const job = await scheduledPublish.add(uid, session.scheduleAt, this.getSelectedChannels(session), session.scheduleKeywords);
+        delete session.scheduleStage; delete session.scheduleAt; delete session.scheduleKeywords;
+        session.step = 'idle';
+        sessions.set(uid, session); await db.saveUserSession(uid, session);
+        await ctx.reply(`✅ 已加入队列：${job.id}\n${publishTimeLabel(job.at)}\n目标：${job.channels.join('、')}\n关键词：${job.keywords.join('、')}\n可返回发布模式选择其他频道，继续创建独立任务。`, { reply_markup: { inline_keyboard: [
+          [{ text: '⏰ 再建定时任务', callback_data: 'schedule_begin' }, { text: '📋 定时任务', callback_data: 'schedule_list' }],
+          [{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]
+        ] } });
+      } catch (e: any) { await ctx.reply(`❌ ${e.message}`); }
+      finally { this.creatingSchedules.delete(uid); }
+    }
+    sessions.set(uid, session); await db.saveUserSession(uid, session);
+  }
+
+  static async scheduleInput(ctx: Context, text: string, session: any, db: typeof database): Promise<boolean> {
+    if (!session.scheduleStage) return false;
+    const uid = ctx.from!.id;
+    if (!isAdminUser(uid)) return true;
+    try {
+      if (session.scheduleStage === 'time') {
+        session.scheduleAt = parsePublishTime(text); session.scheduleStage = 'keywords';
+        await ctx.reply(`时间：${publishTimeLabel(session.scheduleAt)}\n请输入这次任务的关键词（空格分隔多个关键词）。`, this.homeButtons);
+      } else if (session.scheduleStage === 'keywords') {
+        const known = await db.getAllKeywords(isSuperAdmin(uid) ? undefined : uid);
+        const keywords = SearchHandler.parseSearchKeywords(text, known);
+        session.scheduleKeywords = keywords.length ? keywords : [text.trim()];
+        session.scheduleStage = 'confirm';
+        await ctx.reply(`确认定时发布\n${publishTimeLabel(session.scheduleAt)}\n目标：${this.getSelectedChannels(session).join('、')}\n关键词：${session.scheduleKeywords.join('、')}\n保存后可继续创建不同时间、不同频道的任务。`, { reply_markup: { inline_keyboard: [
+          [{ text: '✅ 加入定时队列', callback_data: 'schedule_confirm' }],
+          [{ text: '修改时间', callback_data: 'schedule_begin' }, { text: '取消定时设置', callback_data: 'cancel' }],
+          [{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]
+        ] } });
+      } else await ctx.reply('请先点击“加入定时队列”或取消定时设置。');
+      await db.saveUserSession(uid, session);
+    } catch (e: any) { await ctx.reply(`❌ ${e.message}`); }
+    return true;
+  }
   /** 同一用户同时只跑一个发布任务，避免卡死长轮询后消息全堵死 */
   private static publishingUsers = new Set<number>();
 
@@ -60,6 +127,8 @@ export class PublishHandler {
       );
       return;
     }
+
+    if (await this.scheduleInput(ctx, keyword, session, db)) return;
 
     if (this.publishingUsers.has(userId)) {
       console.warn(`📢 [发布] 用户 ${userId} 仍有任务在跑，拒绝新关键词 "${keyword}"`);
@@ -203,10 +272,11 @@ export class PublishHandler {
         }
       }
 
-      session.currentKeyword = undefined;
-      session.step = 'waiting_keyword';
-      userSessions.set(userId, session);
-      await db.saveUserSession(userId, session);
+      if (userSessions.get(userId) === session) {
+        session.currentKeyword = undefined;
+        session.step = 'waiting_keyword';
+        await db.saveUserSession(userId, session);
+      }
 
       const channelNames = await Promise.all(channelIds.map(channelId => this.getChannelName(bot, channelId)));
       const okList = results.filter(r => r.ok);
@@ -413,7 +483,7 @@ export class PublishHandler {
     // Document 和 Audio 必须成组或单独发送，不能与 Photo/Video 混合
     
     // 1. 发送照片、视频、动画组合
-    const visualMedia = [...photoItems, ...videoItems, ...animationItems];
+    const visualMedia = allMedia.filter(item => ['photo', 'video', 'animation'].includes(item.file_type));
     if (visualMedia.length > 0) {
       await this.sendCompatibleMediaGroup(bot, channelId, visualMedia, mainCaption);
     }
@@ -465,9 +535,9 @@ export class PublishHandler {
       if (chunk.length === 1) {
         // 只有一个媒体，直接发送
         try {
-          await this.sendSingleMediaToChannel(bot, channelId, chunk[0]);
+          await this.sendSingleMediaToChannel(bot, channelId, { ...chunk[0], caption: i === 0 ? caption : '' });
         } catch (err) {
-          console.error('发送单个媒体失败:', err);
+          throw err;
         }
         continue;
       }
@@ -490,15 +560,8 @@ export class PublishHandler {
         );
         console.log(`✅ 媒体组发送成功 (${chunk.length} 个媒体)`);
       } catch (error) {
-        console.error('媒体组发送失败，尝试逐个发送:', error);
-        for (const item of chunk) {
-          try {
-            await this.sendSingleMediaToChannel(bot, channelId, item);
-            await new Promise(resolve => setTimeout(resolve, 1000));
-          } catch (singleError) {
-            console.error('逐个发送媒体失败:', singleError);
-          }
-        }
+        console.error('媒体组发送失败，保留相册，不自动拆图:', error);
+        throw error;
       }
 
       if (i < chunks.length - 1) {

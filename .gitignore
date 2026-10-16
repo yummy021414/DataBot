@@ -46,6 +46,7 @@ tmp/
 *~
 
 # ==================== IDE ====================
+.watermark-tools/
 .vscode/
 .idea/
 *.sublime-*

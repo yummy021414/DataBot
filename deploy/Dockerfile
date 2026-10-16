@@ -44,7 +44,13 @@ WORKDIR /app
 RUN apk add --no-cache \
     sqlite-libs \
     python3 \
+    ffmpeg \
+    fontconfig \
+    font-noto-cjk \
     tzdata
+
+# 让 FFmpeg drawtext 能稳定找到中文字体
+RUN fc-cache -f
 
 # 设置时区为上海
 ENV TZ=Asia/Shanghai
@@ -69,8 +75,7 @@ VOLUME ["/app/data"]
 
 # 健康检查
 HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-  CMD node -e "process.exit(0)" || exit 1
+  CMD node -e "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))" || exit 1
 
 # 启动命令
 CMD ["node", "dist/index.js"]
-

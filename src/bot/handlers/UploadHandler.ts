@@ -4,6 +4,8 @@ import { UserSession, MediaItem, BotMode } from '../../types';
 import { config, getAdminChannelIds, getAdminPersistentChannelId, hasAdminChannelMap } from '../../config';
 import { recordPublishEvent } from '../../services/publishAudit';
 import { checkVaultAccess } from '../../services/vault';
+import { tagCaptionForMedia } from '../../utils/keywordTag';
+import { watermarkService } from '../../services/watermark';
 
 export class UploadHandler {
   /** 同一 Telegram 相册内收齐等待（ms） */
@@ -13,6 +15,33 @@ export class UploadHandler {
   /** key = `${userId}:${groupKey}` */
   private static groupTimeouts: Map<string, NodeJS.Timeout> = new Map();
   private static sessionReadyTimeouts: Map<number, NodeJS.Timeout> = new Map();
+  /** 防止保存按钮重复点击造成重复入库/重复转码 */
+  private static activeUploadJobs: Set<number> = new Set();
+
+  static isProcessing(userId: number): boolean { return this.activeUploadJobs.has(userId); }
+
+  private static dispatch(ctx: Context, work: () => Promise<void>): void {
+    const uid = ctx.from?.id;
+    if (!uid) return;
+    if (this.activeUploadJobs.has(uid)) {
+      void ctx.answerCbQuery('资料正在处理中').catch(() => {});
+      return;
+    }
+    this.activeUploadJobs.add(uid);
+    setImmediate(() => {
+      void work().catch(async () => {
+        await ctx.reply('处理未完成，资料会话已保留，请重试。').catch(() => {});
+      }).finally(() => this.activeUploadJobs.delete(uid));
+    });
+  }
+
+  static async handleSaveOnly(ctx: Context, sessions: Map<number, UserSession>, db: typeof database): Promise<void> {
+    this.dispatch(ctx, () => this.saveOnly(ctx, sessions, db));
+  }
+
+  static async handleSaveAndPublish(ctx: Context, sessions: Map<number, UserSession>, db: typeof database, bot: Telegraf): Promise<void> {
+    this.dispatch(ctx, () => this.saveAndPublish(ctx, sessions, db, bot));
+  }
 
   /** 资料 caption 含非法字符时 Telegram 会 400，导致上传完成却无反馈 */
   private static sanitizeTelegramText(text: string): string {
@@ -175,6 +204,12 @@ export class UploadHandler {
   private static itemCaption(media: any): string | undefined {
     const c = (media.caption || media.groupCaption || '').trim();
     return c || undefined;
+  }
+
+  private static captionWithTag(item: { caption?: string; keyword: string }, media: any, pending: any[]): string | undefined {
+    const group = pending.filter(m => m.batchId === media.batchId);
+    const noCaption = !group.some(m => this.itemCaption(m));
+    return tagCaptionForMedia(item, noCaption && group[0] === media);
   }
 
   static async handleKeywordInput(
@@ -405,6 +440,108 @@ export class UploadHandler {
     await this.renderChannelSelection(ctx, userSessions, bot, false);
   }
 
+  /**
+   * 仅好评图片自动水印；普通上传保持原版。每组完成后持久化，可安全重试。
+   */
+  private static async prepareOriginalUploads(opts: {
+    telegram: any;
+    userId: number;
+    session: UserSession;
+    userSessions: Map<number, UserSession>;
+    db: typeof database;
+    onProgress?: (done: number, total: number, phase: string) => Promise<void>;
+  }): Promise<number> {
+    if (opts.session.pendingText === 'is_review_mode') return this.prepareReviewPhotos(opts);
+    // Ordinary uploads always retain the original.
+    const { userId, session, userSessions, db } = opts;
+    let restored = 0;
+    for (const media of session.pendingMedia || []) {
+      if (!media.watermarked) continue;
+      if (!media.original_file_id) throw new Error('待上传资料缺少原件，请重新上传');
+      media.file_id = media.original_file_id;
+      if (media.original_source_chat_id && media.original_source_msg_id) {
+        media.source_chat_id = media.original_source_chat_id;
+        media.source_msg_id = media.original_source_msg_id;
+      } else {
+        delete media.source_chat_id;
+        delete media.source_msg_id;
+      }
+      for (const key of ['watermarked', 'watermark_version', 'watermarked_at', 'watermark_album_saved',
+        'watermark_album_caption', 'original_file_id', 'original_source_chat_id', 'original_source_msg_id']) delete media[key];
+      restored++;
+    }
+    if (restored) {
+      userSessions.set(userId, session);
+      await db.saveUserSession(userId, session);
+      await db.saveImmediately();
+    }
+    return restored;
+  }
+
+
+  private static async prepareReviewPhotos(opts: {
+    telegram: any; userId: number; session: UserSession; userSessions: Map<number, UserSession>; db: typeof database;
+    onProgress?: (done: number, total: number, phase: string) => Promise<void>;
+  }): Promise<number> {
+    const { telegram, userId, session, userSessions, db, onProgress } = opts;
+    const pending = session.pendingMedia || [];
+    const total = pending.filter(m => m.file_type === 'photo').length;
+    if (!total) return 0;
+    const chat = getAdminPersistentChannelId(userId);
+    await watermarkService.assertReady(chat);
+    const groups = new Map<string, any[]>();
+    for (const media of pending) {
+      if (media.file_type !== 'photo' && media.file_type !== 'video') continue;
+      const key = media.batchId || 'single_' + pending.indexOf(media);
+      if (!groups.has(key)) groups.set(key, []);
+      groups.get(key)!.push(media);
+    }
+    let done = 0;
+    const heartbeat = setInterval(() => {
+      void onProgress?.(done, total, '正在为好评图片添加水印').catch(() => {});
+    }, 15000);
+    try {
+      for (const group of groups.values()) {
+        if (!group.some(m => m.file_type === 'photo')) continue;
+        const primary = group.find(m => this.itemCaption(m)) || group[0];
+        const caption = this.captionWithTag({ caption: this.itemCaption(primary), keyword: session.currentKeyword! }, primary, pending) || '';
+        for (let offset = 0; offset < group.length; offset += 10) {
+          const chunk = group.slice(offset, offset + 10);
+          const photos = chunk.filter(m => m.file_type === 'photo');
+          if (chunk.every(m => m.watermark_album_saved)) { done += photos.length; continue; }
+          // Original videos accompany the photos solely to preserve the album.
+          const results = await watermarkService.processTelegramAlbum(telegram, chunk.map(media => ({
+            fileId: media.file_id, type: media.file_type,
+            ready: media.file_type !== 'photo' || !!media.watermarked
+          })), chat!, offset === 0 ? caption : '',
+          async n => { await onProgress?.(done, total, '好评相册准备 ' + n + '/' + chunk.length); });
+          for (let i = 0; i < chunk.length; i++) {
+            const media = chunk[i], result = results[i];
+            if (media.file_type === 'photo') {
+              media.original_file_id ||= media.file_id;
+              media.original_source_chat_id ||= media.source_chat_id;
+              media.original_source_msg_id ||= media.source_msg_id;
+              media.file_id = result.fileId;
+              media.watermarked = true;
+              media.watermark_version = result.version;
+              media.watermarked_at = new Date().toISOString();
+            }
+            media.source_chat_id = result.sourceChatId;
+            media.source_msg_id = result.sourceMsgId;
+            media.watermark_album_saved = true;
+            media.watermark_album_caption = offset === 0 && i === 0 ? caption : '';
+          }
+          userSessions.set(userId, session);
+          await db.saveUserSession(userId, session);
+          await db.saveImmediately();
+          done += photos.length;
+          await onProgress?.(done, total, '好评图片水印完成');
+        }
+      }
+    } finally { clearInterval(heartbeat); }
+    return done;
+  }
+
   static async renderChannelSelection(
     ctx: Context,
     userSessions: Map<number, UserSession>,
@@ -486,7 +623,7 @@ export class UploadHandler {
     }
   }
 
-  static async handleSaveOnly(
+  private static async saveOnly(
     ctx: Context, 
     userSessions: Map<number, UserSession>, 
     db: typeof database
@@ -504,6 +641,22 @@ export class UploadHandler {
 
     try {
       const processingMsg = await ctx.reply('💾 正在保存并同步备份…');
+
+      await this.prepareOriginalUploads({
+        telegram: ctx.telegram,
+        userId,
+        session,
+        userSessions,
+        db,
+        onProgress: async (done, total, phase) => {
+          await ctx.telegram.editMessageText(
+            ctx.chat?.id,
+            processingMsg.message_id,
+            undefined,
+            `🛡️ ${phase}：${done}/${total}\n\n机器人其他功能仍可正常使用，请勿重复点击。`
+          ).catch(() => {});
+        }
+      });
 
       let savedCount = 0;
       const savedItems: MediaItem[] = []; // 🚀 记录以便后续备份
@@ -525,6 +678,7 @@ export class UploadHandler {
         }
 
         const mediaItem: Omit<MediaItem, 'id'> = {
+          upload_key: `${userId}:${media.batchId}:${session.pendingMedia.indexOf(media)}`,
           keyword: session.currentKeyword,
           file_id: media.file_id,
           file_type: media.file_type as any,
@@ -533,26 +687,39 @@ export class UploadHandler {
           uploaded_at: new Date().toISOString(),
           is_published: false,
           batchId: media.batchId || (session as any).currentBatchId || `batch_${Date.now()}`,
-          is_review: isReviewMode 
+          is_review: isReviewMode,
+          source_chat_id: media.source_chat_id,
+          source_msg_id: media.source_msg_id,
+          watermarked: media.watermarked,
+          watermark_version: media.watermark_version,
+          watermarked_at: media.watermarked_at,
+          original_file_id: media.original_file_id,
+          original_source_chat_id: media.original_source_chat_id,
+          original_source_msg_id: media.original_source_msg_id
         };
 
+        mediaItem.caption = media.watermark_album_saved ? (media.watermark_album_caption || undefined) : this.captionWithTag(mediaItem, media, session.pendingMedia);
         const id = await db.saveMedia(mediaItem);
         savedItems.push({ ...mediaItem, id });
         savedCount++;
       }
 
       // 即使是「仅保存」，也强制发到金库并锁定 source_*（换 Token 可复活）
+      await db.saveImmediately();
       const persistentChannelId = getAdminPersistentChannelId(userId);
       let vaultOk = false;
       let vaultError = '';
       if (persistentChannelId) {
-        console.log(`📡 [影子备份] 正在同步 ${savedCount} 个文件到永久仓库 ${persistentChannelId}...`);
+        // Reassemble the existing album/caption in the vault using cached file_ids.
+        const missingVaultItems = savedItems.filter(item => !session.pendingMedia!.some(m => m.file_id === item.file_id && m.watermark_album_saved));
         try {
-          await this.publishToChannel(ctx as any, persistentChannelId, savedItems, session.currentKeyword, db, {
-            writeSource: true,
-            forceSource: true,
-            requireSuccess: true
-          });
+          if (missingVaultItems.length > 0) {
+            await this.publishToChannel(ctx as any, persistentChannelId, missingVaultItems, session.currentKeyword, db, {
+              writeSource: true,
+              forceSource: true,
+              requireSuccess: true
+            });
+          }
           vaultOk = true;
         } catch (e: any) {
           vaultError = e?.message || String(e);
@@ -605,7 +772,7 @@ export class UploadHandler {
     }
   }
 
-  static async handleSaveAndPublish(
+  private static async saveAndPublish(
     ctx: Context, 
     userSessions: Map<number, UserSession>, 
     db: typeof database, 
@@ -635,6 +802,32 @@ export class UploadHandler {
       processingMsg = await ctx.reply('💾📢 正在保存并发布（请勿重复点击）…');
     } catch {}
 
+    try {
+      await this.prepareOriginalUploads({
+        telegram: ctx.telegram,
+        userId,
+        session,
+        userSessions,
+        db,
+        onProgress: async (done, total, phase) => {
+          if (!processingMsg?.message_id) return;
+          await ctx.telegram.editMessageText(
+            chatId,
+            processingMsg.message_id,
+            undefined,
+            `🛡️ ${phase}：${done}/${total}\n\n机器人其他功能仍可正常使用，请勿重复点击。`
+          ).catch(() => {});
+        }
+      });
+    } catch (error: any) {
+      await this.safeNotifyUser(
+        ctx.telegram,
+        chatId,
+        `❌ ${error?.message || error}\n\n上传会话仍已保留，可修复配置后再次点击继续。`
+      );
+      return;
+    }
+
     const sessionSnap = {
       currentKeyword: session.currentKeyword,
       selectedChannel: session.selectedChannel,
@@ -644,7 +837,7 @@ export class UploadHandler {
       mode: session.mode
     };
 
-    setImmediate(async () => {
+    await (async () => {
       try {
         await this.runSaveAndPublishJob({
           telegram: ctx.telegram,
@@ -665,7 +858,7 @@ export class UploadHandler {
           { reply_markup: { inline_keyboard: [[{ text: '🏠 返回主菜单', callback_data: 'back_to_main' }]] } }
         );
       }
-    });
+    })();
   }
 
   private static async runSaveAndPublishJob(opts: {
@@ -700,6 +893,7 @@ export class UploadHandler {
       for (const media of session.pendingMedia) {
         try {
         const mediaItem: Omit<MediaItem, 'id'> = {
+          upload_key: `${userId}:${media.batchId}:${session.pendingMedia.indexOf(media)}`,
           keyword: session.currentKeyword,
           file_id: media.file_id,
           file_type: media.file_type as any,
@@ -716,30 +910,44 @@ export class UploadHandler {
           is_published: true,
           published_at: new Date().toISOString(),
           batchId: media.batchId || (session as any).currentBatchId || `batch_${Date.now()}`,
-          is_review: isReviewMode 
+          is_review: isReviewMode,
+          source_chat_id: media.source_chat_id,
+          source_msg_id: media.source_msg_id,
+          watermarked: media.watermarked,
+          watermark_version: media.watermark_version,
+          watermarked_at: media.watermarked_at,
+          original_file_id: media.original_file_id,
+          original_source_chat_id: media.original_source_chat_id,
+          original_source_msg_id: media.original_source_msg_id
         };
 
+        mediaItem.caption = media.watermark_album_saved ? (media.watermark_album_caption || undefined) : this.captionWithTag(mediaItem, media, session.pendingMedia);
         const id = await db.saveMedia(mediaItem);
         savedItems.push({ ...mediaItem, id }); // 🚀 记录
         savedCount++;
           console.log(`✅ 已保存媒体 ${savedCount}/${session.pendingMedia.length}`);
         } catch (saveError) {
           console.error('❌ 保存单个媒体失败:', saveError);
+          throw saveError;
         }
       }
 
       console.log('📢 开始发布到频道...');
+      await db.saveImmediately();
       // 先发金库锁定 source_*，再发业务频道（业务频道不得覆盖金库坐标）
       const persistentChannelId = getAdminPersistentChannelId(userId);
       let vaultNote = '';
       if (persistentChannelId && !session.selectedChannels.includes(persistentChannelId)) {
         console.log(`📡 [影子备份] 发布前同步到永久仓库...`);
         try {
-          await this.publishToChannel(bot, persistentChannelId, savedItems, session.currentKeyword, db, {
-            writeSource: true,
-            forceSource: true,
-            requireSuccess: true
-          });
+          const missingVaultItems = savedItems.filter(item => !session.pendingMedia.some(m => m.file_id === item.file_id && m.watermark_album_saved));
+          if (missingVaultItems.length > 0) {
+            await this.publishToChannel(bot, persistentChannelId, missingVaultItems, session.currentKeyword, db, {
+              writeSource: true,
+              forceSource: true,
+              requireSuccess: true
+            });
+          }
           vaultNote = '\n📦 金库备份: 成功';
         } catch (e: any) {
           console.error('备份同步失败:', e.message);
@@ -753,11 +961,14 @@ export class UploadHandler {
       for (let index = 0; index < session.selectedChannels.length; index++) {
         const channelId = session.selectedChannels[index];
         try {
-          const result = await this.publishToChannel(bot, channelId, savedItems, session.currentKeyword, db, {
+          const targetItems = channelId === persistentChannelId
+            ? savedItems.filter(item => !session.pendingMedia.some(m => m.file_id === item.file_id && m.watermark_album_saved))
+            : savedItems;
+          const result = targetItems.length ? await this.publishToChannel(bot, channelId, targetItems, session.currentKeyword, db, {
             writeSource: true,
             forceSource: persistentChannelId === channelId,
             requireSuccess: true
-          });
+          }) : { sent: 0, failed: 0 };
           publishResults.push({ channelId, sent: result.sent });
           recordPublishEvent({
             keyword: session.currentKeyword,
@@ -815,12 +1026,7 @@ export class UploadHandler {
     } catch (error: any) {
       console.error('保存并发布错误:', error);
 
-      try {
-        userSessions.delete(userId);
-        await db.clearUserSession(userId);
-      } catch (cleanupError) {
-        console.error('清理会话失败:', cleanupError);
-      }
+      // Preserve the upload session on failure. upload_key makes a retry idempotent at save time.
 
       let errorMessage = '❌ 发布时发生错误，请稍后重试。';
       if (error.message?.includes('发布超时')) {
@@ -875,7 +1081,7 @@ export class UploadHandler {
     const forceSource = Boolean(options?.forceSource);
     const requireSuccess = Boolean(options?.requireSuccess);
 
-    if (requireSuccess || forceSource) {
+    if (forceSource) {
       const access = await checkVaultAccess(telegram, channelId);
       if (!access.ok) {
         const detail = [
@@ -917,7 +1123,7 @@ export class UploadHandler {
       throw new Error(`全部发送失败（0/${mediaList.length}），目标 ${channelId}`);
     }
     if (requireSuccess && failed > 0 && sent < mediaList.length) {
-      console.warn(`⚠️ 部分发送失败 ${failed}/${mediaList.length}`);
+      throw new Error(`部分发送失败 ${failed}/${mediaList.length}，未自动拆散相册`);
     }
     return { sent, failed };
   }
@@ -941,75 +1147,38 @@ export class UploadHandler {
     };
 
     const groupedMedia = this.groupMediaByType(batchItems);
-    const photoItems = groupedMedia['photo'] || [];
-    const videoItems = groupedMedia['video'] || [];
-    const documentItems = groupedMedia['document'] || [];
-    const audioItems = groupedMedia['audio'] || [];
-    const combinedMedia = [...photoItems, ...videoItems, ...documentItems, ...audioItems];
-
-    if (combinedMedia.length > 0) {
-      console.log(`📸 发送一组媒体 - ${combinedMedia.length} 个 (batch=${batchItems[0]?.batchId || 'n/a'})`);
-
-      let captionIndex = 0;
-      let mainCaption = '';
-      for (let j = 0; j < combinedMedia.length; j++) {
-        const c = (combinedMedia[j].caption || (combinedMedia[j] as any).groupCaption || '').trim();
-        if (c) {
-          captionIndex = j;
-          mainCaption = c;
-          break;
-        }
-      }
-
-      if (combinedMedia.length <= 10) {
+    // Preserve original order; Telegram only permits compatible media in one album.
+    const visual = batchItems.filter(m => m.file_type === 'photo' || m.file_type === 'video');
+    const documentItems = batchItems.filter(m => m.file_type === 'document');
+    const audioItems = batchItems.filter(m => m.file_type === 'audio');
+    const mainCaption = batchItems.map(m => (m.caption || (m as any).groupCaption || '').trim()).find(Boolean) || '';
+    let captionUsed = false;
+    for (const compatible of [visual, documentItems, audioItems]) {
+      for (const chunk of this.chunkArray(compatible, 10)) {
+        const caption = captionUsed ? '' : mainCaption;
+        captionUsed = true;
+        let messages: any[];
         try {
-          const mediaGroup = combinedMedia.map((item, index) => ({
-            type: item.file_type as any,
-            media: item.file_id,
-            caption: index === captionIndex ? mainCaption : undefined
-          }));
-          const sentMsgs = await telegram.sendMediaGroup(channelId, mediaGroup);
-          for (let i = 0; i < sentMsgs.length; i++) {
-            await recordSource(combinedMedia[i].id, sentMsgs[i].message_id);
-            sent++;
+          if (chunk.length === 1) {
+            const message = await this.sendSingleMediaToChannel(telegram, channelId, { ...chunk[0], caption }, keyword);
+            if (!message) throw new Error('未取得发送结果');
+            messages = [message];
+          } else {
+            messages = await telegram.sendMediaGroup(channelId, chunk.map((item, index) => ({
+              type: item.file_type, media: item.file_id, caption: index === 0 ? caption || undefined : undefined
+            })));
           }
         } catch (error) {
-          console.error('发送完整媒体组失败，降级为单个发送:', error);
-          for (let i = 0; i < combinedMedia.length; i++) {
-            try {
-              const msg = await this.sendSingleMediaToChannel(telegram, channelId, combinedMedia[i], keyword);
-              if (msg) {
-                await recordSource(combinedMedia[i].id, msg.message_id);
-                sent++;
-              } else {
-                failed++;
-              }
-            } catch (singleError) {
-              failed++;
-              console.error(`发送单个媒体 ${i + 1} 错误:`, singleError);
-            }
-          }
+          // Never resend an uncertain/failed album as individual messages.
+          console.error('相册发送失败，保留原分组，不自动拆图:', error);
+          failed += chunk.length;
+          continue;
         }
-      } else {
-        const chunks = this.chunkArray(combinedMedia, 10);
-        for (let i = 0; i < chunks.length; i++) {
-          const chunk = chunks[i];
-          try {
-            const mediaGroup = chunk.map((item, index) => ({
-              type: item.file_type as any,
-              media: item.file_id,
-              caption: (i === 0 && index === captionIndex) ? mainCaption : undefined
-            }));
-            const sentMsgs = await telegram.sendMediaGroup(channelId, mediaGroup);
-            for (let k = 0; k < sentMsgs.length; k++) {
-              await recordSource(chunk[k].id, sentMsgs[k].message_id);
-              sent++;
-            }
-            if (i < chunks.length - 1) await new Promise(r => setTimeout(r, 2000));
-          } catch (error) {
-            console.error(`发送媒体组 ${i + 1} 失败:`, error);
-            failed += chunk.length;
-          }
+        if (messages.length !== chunk.length) throw new Error('相册返回数量不一致');
+        for (let i = 0; i < messages.length; i++) {
+          // Persistence failures must not trigger another Telegram send.
+          await recordSource(chunk[i].id, messages[i].message_id);
+          sent++;
         }
       }
     }

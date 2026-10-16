@@ -2008,7 +2008,7 @@ except Exception as e:
     targetChatId: number | string,
     sourceChatId: string,
     sourceMsgIds: number[]
-  ): Promise<{ success: boolean }> {
+  ): Promise<{ success: boolean; messageIds?: number[] }> {
     try {
       const client = await this.getActiveClient();
       if (!client) throw new Error('没有激活的账号');
@@ -2016,12 +2016,12 @@ except Exception as e:
       console.log(`[自愈系统] 正在批量同步永久仓库 (数量: ${sourceMsgIds.length}): ${sourceChatId}`);
 
       // 一次性转发整个数组，确保相册不散架
-      await client.forwardMessages(targetChatId, {
+      const sent = await client.forwardMessages(targetChatId, {
         messages: sourceMsgIds,
         fromPeer: sourceChatId
       });
 
-      return { success: true };
+      return { success: true, messageIds: (Array.isArray(sent) ? sent : [sent]).map(message => message.id) };
     } catch (error: any) {
       console.error(`[自愈系统] 批量转发失败:`, error.message);
       return { success: false };

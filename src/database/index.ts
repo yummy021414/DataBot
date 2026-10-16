@@ -34,6 +34,23 @@ export class Database {
     return this.jsonDb.deleteMedia(id);
   }
 
+  async rememberSearchGroup(chatId: number, messageIds: number[], items: MediaItem[]): Promise<void> {
+    return this.jsonDb.rememberSearchGroup(chatId, messageIds, items);
+  }
+
+  async deleteSearchGroup(chatId: number, messageId: number, userId?: number) {
+    return this.jsonDb.deleteSearchGroup(chatId, messageId, userId);
+  }
+
+  async getSearchGroup(chatId: number, messageId: number, userId?: number) {
+    return this.jsonDb.getSearchGroup(chatId, messageId, userId);
+  }
+
+  async replaceSearchGroup(chatId: number, messageId: number, userId: number | undefined,
+    expected: MediaItem[], replacement: MediaItem[]): Promise<void> {
+    return this.jsonDb.replaceSearchGroup(chatId, messageId, userId, expected, replacement);
+  }
+
   async updateMediaPublished(id: number, channelId: string): Promise<void> {
     return this.jsonDb.updateMediaPublished(id, channelId);
   }
@@ -64,7 +81,26 @@ export class Database {
     return this.jsonDb.updateMediaFileId(id, fileId, fileType);
   }
 
-  async batchUpdateMediaFileIds(
+  async updateMediaWatermark(
+    id: number,
+    update: {
+      fileId: string;
+      version: number;
+      sourceChatId: string;
+      sourceMsgId: number;
+      expectedFileId?: string;
+    }
+  ): Promise<void> {
+    return this.jsonDb.updateMediaWatermark(id, update);
+  }
+
+    async updateMediaWatermarkBatch(updates: Array<{
+      id: number; fileId: string; version: number; sourceChatId: string; sourceMsgId: number; expectedFileId?: string;
+    }>): Promise<void> {
+      return this.jsonDb.updateMediaWatermarkBatch(updates);
+    }
+
+    async batchUpdateMediaFileIds(
     updates: Array<{ id: number; fileId: string; fileType?: MediaItem['file_type'] }>
   ): Promise<number> {
     return this.jsonDb.batchUpdateMediaFileIds(updates);

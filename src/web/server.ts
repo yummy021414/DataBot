@@ -9,7 +9,7 @@ import https from 'https';
 // 安全转义函数
 function escapeHtmlAttribute(str: string): string {
   if (!str) return '';
-  return String(str).replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '&#92;');
+  return String(str).replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\\/g, '&#92;');
 }
 
 export function startWebServer(bot: Telegraf) {
@@ -17,7 +17,7 @@ export function startWebServer(bot: Telegraf) {
   const PORT = process.env.PORT || 3000;
   const albumsDir = path.join(process.cwd(), 'data/public/albums');
 
-  const httpsAgent = new https.Agent({ rejectUnauthorized: false });
+  const httpsAgent = new https.Agent();
 
   if (!fs.existsSync(albumsDir)) fs.mkdirSync(albumsDir, { recursive: true });
   app.use('/media', express.static(albumsDir));
@@ -81,6 +81,7 @@ export function startWebServer(bot: Telegraf) {
 
     res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
     const { groups, name } = albumData;
+    const safeAlbumName = escapeHtmlAttribute(name || '相册');
 
     const menuHtml = groups.map((g: any, index: number) => {
       const safeId = escapeHtmlAttribute(g.id);
@@ -126,7 +127,7 @@ export function startWebServer(bot: Telegraf) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
-<title>${name || '相册'}</title>
+<title>${safeAlbumName}</title>
 <style>
 :root{--primary:#667eea;--secondary:#764ba2;--bg:#f8faff;--text:#2d3436;--glass:rgba(255,255,255,0.75);--card:#fff;--transition:all 0.4s cubic-bezier(0.23,1,0.32,1);}
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}

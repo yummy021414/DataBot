@@ -4,6 +4,7 @@ export interface MediaItem {
   file_id: string;
   file_type: 'photo' | 'video' | 'document' | 'audio' | 'voice' | 'animation' | 'video_note';
   caption?: string;
+  caption_overridden?: boolean; // 替换后不能从旧金库消息恢复过期文案
   channel_id?: string;
   uploaded_by: number;
   uploaded_at: string;
@@ -14,6 +15,14 @@ export interface MediaItem {
   // 🚀 终极保险：永久坐标，用于换 Token 后的全自动复活
   source_chat_id?: string; // 原始频道或收藏夹的 ID
   source_msg_id?: number;  // 消息在原始频道里的 ID
+  // 水印迁移状态。保留原坐标，便于审计及未来回滚。
+  watermarked?: boolean;
+  watermark_version?: number;
+  watermarked_at?: string;
+  original_file_id?: string;
+  original_source_chat_id?: string;
+  original_source_msg_id?: number;
+  upload_key?: string;
 }
 
 export interface AlbumGroup {
