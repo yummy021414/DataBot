@@ -216,6 +216,11 @@ export class PublishHandler {
         const batchEstimate = publicationBatches(mediaItems).length;
 
         console.log(`📢 [发布] ${ki + 1}/${keywords.length} 关键词="${kw}" → ${mediaItems.length} 文件 / 约 ${batchEstimate} 组`);
+        await this.safeReply(
+          ctx,
+          `⏳ 正在发布「${kw}」（${ki + 1}/${keywords.length}）：${mediaItems.length} 个文件 / ${batchEstimate} 组\n` +
+          `（发送完成后会提示）`
+        );
         const successes: Array<{ channelId: string; count: number }> = [];
         const failedChannels: string[] = [];
         await Promise.all(channelIds.map(async channelId => {
