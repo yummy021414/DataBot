@@ -315,7 +315,7 @@ export class JsonDatabase {
       total.lastAt = Math.max(total.lastAt, entry.lastAt);
       totals.set(entry.keyword, total);
     }
-    return [...totals.values()].sort((a, b) => b.count - a.count || b.lastAt - a.lastAt || a.keyword.localeCompare(b.keyword));
+    return [...totals.values()].sort((a, b) => b.lastAt - a.lastAt || a.keyword.localeCompare(b.keyword));
   }
 
   // 🚀 新增：专门获取好评图
