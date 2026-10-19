@@ -37,6 +37,7 @@ export class PublicationQueue {
   private tails = new Map<string, Promise<void>>();
   private chats = new Map<string, Promise<{ id: string; group: boolean }>>();
   private next = new Map<string, number>();
+  private groupSends = new Map<string, Array<{ at: number; count: number }>>();
   private pending = new Map<string, number>();
   private blocked: Record<string, string> = {};
   private active = 0;
@@ -116,11 +117,26 @@ export class PublicationQueue {
     const next = this.slots.shift();
     if (next) next(); else this.active--;
   }
+  // Allow short groups to finish promptly while keeping the rolling group quota.
+  private groupReadyAt(id: string, count: number, now: number): number {
+    const window = this.timing.group * 20;
+    const recent = (this.groupSends.get(id) || []).filter(entry => entry.at + window > now);
+    this.groupSends.set(id, recent);
+    let excess = recent.reduce((sum, entry) => sum + entry.count, 0) + count - 20;
+    for (const entry of recent) {
+      if (excess <= 0) break;
+      excess -= entry.count;
+      if (excess <= 0) return entry.at + window;
+    }
+    return now;
+  }
   private async send(telegram: any, chat: { id: string; group: boolean }, items: MediaItem[]): Promise<any[]> {
     if (!items.length || items.length > 10) throw new Error('无效资料组大小');
     this.assertReady(chat.id);
     for (let attempt = 0; attempt < 4; attempt++) {
-      await wait(Math.max(this.next.get(chat.id) || 0, this.cooldown) - Date.now());
+      const queuedAt = Date.now();
+      const groupAt = chat.group ? this.groupReadyAt(chat.id, items.length, queuedAt) : queuedAt;
+      await wait(Math.max(this.next.get(chat.id) || 0, this.cooldown, groupAt) - queuedAt);
       await this.acquire();
       let timer: NodeJS.Timeout | undefined;
       let outstanding: Promise<any> | undefined;
@@ -130,7 +146,11 @@ export class PublicationQueue {
         while (Date.now() < Math.max(this.globalNext, this.cooldown)) await wait(Math.max(this.globalNext, this.cooldown) - Date.now());
         const started = Date.now();
         this.globalNext = started + items.length * this.timing.globalPerMessage;
-        this.next.set(chat.id, started + (chat.group ? this.timing.group * items.length : this.timing.channel));
+        this.next.set(chat.id, started + this.timing.channel);
+        if (chat.group) {
+          this.groupReadyAt(chat.id, items.length, started);
+          this.groupSends.get(chat.id)!.push({ at: started, count: items.length });
+        }
         const methods: Record<string, string> = { photo: 'sendPhoto', video: 'sendVideo', document: 'sendDocument',
           audio: 'sendAudio', voice: 'sendVoice', animation: 'sendAnimation', video_note: 'sendVideoNote' };
         // Journal before sending: a restart must never silently retry an uncertain request.
@@ -158,7 +178,7 @@ export class PublicationQueue {
           throw new Error('发送返回数量或消息标识异常，请核对频道');
         }
         delete this.blocked[chat.id]; this.persist();
-        console.log(`📢 [发送耗时] 目标=${chat.id} 文件=${items.length} API=${Date.now() - started}ms 重试=${attempt}`);
+        console.log(`📢 [发送耗时] 目标=${chat.id} 文件=${items.length} 排队=${started - queuedAt}ms API=${Date.now() - started}ms 重试=${attempt}`);
         return result;
       } catch (error: any) {
         const code = error?.response?.error_code;

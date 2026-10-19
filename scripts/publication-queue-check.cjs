@@ -35,6 +35,23 @@ const result = () => ({ message_id: ++sequence });
   assert.deepEqual(calls.filter(c => c.startsWith('-1:')), ['-1:a1', '-1:a2', '-1:b1', '-1:b2']);
   assert.equal(peak, 2);
 
+  // A first album must not force a 31-second delay before the second;
+  // the third album must still respect the rolling 20-message quota.
+  const groups = new PublicationQueue(path.join(root, 'group-window.json'));
+  const clock = 1000000;
+  groups.groupSends.set('-8', [{ at: clock, count: 10 }]);
+  assert.equal(groups.groupReadyAt('-8', 10, clock + 1100), clock + 1100);
+  groups.groupSends.get('-8').push({ at: clock + 1100, count: 10 });
+  assert.equal(groups.groupReadyAt('-8', 10, clock + 2200), clock + 62000);
+  assert.equal(groups.groupReadyAt('-8', 10, clock + 62000), clock + 62000);
+  const groupQueue = make('group-integration');
+  await groupQueue.run({ ...tg, getChat: async id => ({ id, type: 'supergroup' }) }, '-9', async send => {
+    await send(source.slice(0, 10));
+    assert.equal(groupQueue.groupSends.get('-9')[0].count, 10);
+    assert(groupQueue.next.get('-9') <= Date.now() + timing.channel);
+    await send(source.slice(10));
+  });
+
   let attempts = 0; const rate = make('rate'); const started = Date.now();
   await rate.run({ ...tg, sendPhoto: async () => {
     if (++attempts === 1) throw { response: { error_code: 429, parameters: { retry_after: 1 } } };

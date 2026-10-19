@@ -164,16 +164,22 @@ export class SearchHandler {
         for (let i = 0; i < batchIds.length; i++) {
           const batchItems = batches[batchIds[i]];
           const groupedMedia = this.groupMediaByType(batchItems);
+          const batchStarted = Date.now();
+          let recordMs = 0;
           try {
             await this.sendMediaGroups(ctx, groupedMedia, true, async messages => {
+              const recordStarted = Date.now();
               try {
                 await db.rememberSearchGroup(ctx.chat!.id, messages.map(message => message.message_id), batchItems);
               } catch (error) {
                 // Recording failure is not a Telegram send failure; do not resend the media.
                 console.error('搜索结果引用记录保存失败:', error);
                 await ctx.reply('⚠️ 资料已发送，但引用记录保存失败。请稍后重新搜索，再使用引用删除或替换。').catch(() => {});
+              } finally {
+                recordMs += Date.now() - recordStarted;
               }
             });
+            console.log(`[搜索组耗时] 关键词="${kw}" 组=${i + 1}/${batchIds.length} 文件=${batchItems.length} 总计=${Date.now() - batchStarted}ms 引用保存=${recordMs}ms`);
           } catch (err: any) {
             console.error(`[搜索发送失败] 关键词="${kw}" 组 ${i + 1}:`, err.message);
           }
@@ -412,9 +418,11 @@ export class SearchHandler {
     
     for (let i = 0; i < chunks.length; i++) {
       const chunk = chunks[i];
+      const started = Date.now();
       if (chunk.length === 1) {
         try {
           await this.sendSingleMedia(ctx, chunk[0], record);
+          console.log(`[搜索单条耗时] 目标=${chatId} 耗时=${Date.now() - started}ms`);
         } catch (err) {}
         continue;
       }
@@ -430,8 +438,10 @@ export class SearchHandler {
         });
 
         const sent = await ctx.replyWithMediaGroup(mediaGroup);
+        console.log(`[搜索发送耗时] 目标=${chatId} 文件=${chunk.length} API=${Date.now() - started}ms`);
         if (record) await record(sent);
       } catch (error: any) {
+        console.warn(`[搜索整组失败] 目标=${chatId} 文件=${chunk.length} 耗时=${Date.now() - started}ms 错误=${error?.response?.error_code || 'unknown'} ${error.message}`);
         // 如果整组发送失败（常见于 Token 变更后的 file_id 失效）
         const handled = await tryBotLevelHealing(chunk);
         if (!handled) {
@@ -446,7 +456,9 @@ export class SearchHandler {
       }
 
       if (i < chunks.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // API time already contributes to pacing; do not add another fixed 2 seconds.
+        const remaining = 1100 - (Date.now() - started);
+        if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
       }
     }
   }
