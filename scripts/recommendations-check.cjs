@@ -15,7 +15,9 @@ const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keywor
   assert.deepEqual(store.capture('-10011'), []);
   const d = store.create(1, [channel('-10011'), channel('-10022')]);
   d.caption = '本期特别推荐'; d.keywords = ['可可']; store.change(d);
+  d.entities = [{ type: 'text_link', offset: 0, length: 2, url: 'https://t.me/example' }]; store.change(d);
   assert.throws(() => store.render(d, '-10011'), /尚未/);
+  assert.equal(store.render(d, '-10011', true).reply_markup.inline_keyboard[0][0].text, '可可 · 待发布');
   store.record('-10011', store.capture('-10011'), [delivery('可可', 11), delivery('可可', 12), delivery('可可', 15, 'b'), delivery('喜多多', 20)]);
   store.record('-10022', store.capture('-10022'), [delivery('可可', 91)]);
   assert.deepEqual(store.render(d, '-10011').reply_markup.inline_keyboard.flat().map(b => b.url), ['https://t.me/c/11/11', 'https://t.me/c/11/15']);
@@ -27,12 +29,14 @@ const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keywor
     editMessageText: async (id, msg, _, text, extra) => { calls.push(['edit', id, msg, text, extra]); } };
   await store.push(d, d.revision, telegram);
   assert.equal(calls.filter(c => c[0] === 'send').length, 2);
+  assert.deepEqual(calls[0][3].entities, d.entities);
   const loaded = new RecommendationStore(file), restored = loaded.get(1);
   restored.keywords.push('喜多多'); loaded.change(restored);
   assert.throws(() => loaded.render(restored, '-10022'), /喜多多/);
   loaded.record('-10022', loaded.capture('-10022'), [delivery('喜多多', 95)]);
   await loaded.push(restored, restored.revision, telegram);
   assert.deepEqual(calls.filter(c => c[0] === 'edit').map(c => c[2]), [100, 200]);
+  assert.deepEqual(calls.filter(c => c[0] === 'edit')[0][4].entities, d.entities);
   assert.equal(calls.filter(c => c[0] === 'send').length, 2);
   await assert.rejects(loaded.push(restored, restored.revision - 1, telegram), /重新预览/);
   const oldEdition = loaded.capture('-10011'); restored.active = false; loaded.change(restored);
@@ -71,15 +75,20 @@ const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keywor
   const ctx = { from: { id: 1 }, chat: { id: 1, type: 'private' }, telegram: { ...telegram, getChat: async id => ({ id: Number(id), title: id, type: 'channel' }) },
     answerCbQuery: async () => {}, reply: async (text, extra) => { replies.push({ text, extra }); } };
   const action = async data => { ctx.callbackQuery = { data }; await Handler.action(ctx, sessions); };
+  await action('recommend_menu'); assert.match(replies.at(-1).text, /已选择 1 个目标/);
   await action('recommend_new'); const wizard = recommendations.get(1);
   assert.equal(wizard.input, 'caption');
-  await Handler.input(ctx, '自定义推荐文案', sessions); assert.equal(wizard.input, 'keywords');
+  ctx.message = { text: '😀自定义推荐文案', entities: [{ type: 'text_link', offset: 2, length: 3, url: 'https://t.me/example' }, { type: 'bold', offset: 5, length: 4 }] };
+  await Handler.input(ctx, ctx.message.text, sessions); assert.equal(wizard.input, 'keywords');
+  assert.deepEqual(wizard.entities, ctx.message.entities);
   await Handler.input(ctx, '可可 可可', sessions); assert.deepEqual(wizard.keywords, ['可可']); assert(!wizard.input);
+  assert.deepEqual(replies.at(-1).extra.entities, ctx.message.entities);
+  assert.equal(replies.at(-1).extra.reply_markup.inline_keyboard[0][0].text, '可可 · 待发布');
   await action(`rec:1:${wizard.id}:add:0`); await Handler.input(ctx, '喜多多 可可', sessions);
   assert.deepEqual(wizard.keywords, ['可可', '喜多多']);
   await action(`rec:1:${wizard.id}:remove:0`); await Handler.input(ctx, '喜多多', sessions); assert.deepEqual(wizard.keywords, ['可可']);
   await action(`rec:2:${wizard.id}:end_confirm:${wizard.revision}`); assert(wizard.active);
-  await action(`rec:1:${wizard.id}:preview:0`); assert.match(replies.at(-1).text, /尚未/);
+  await action(`rec:1:${wizard.id}:preview:0`); assert.match(replies.at(-1).text, /请先发布/);
   recommendations.record('-10055', recommendations.capture('-10055'), [delivery('可可', 60)]);
   await action(`rec:1:${wizard.id}:preview:0`); assert(replies.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data.includes(':push:'));
   database.getManagedChannels = async () => [];

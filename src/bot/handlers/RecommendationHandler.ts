@@ -29,9 +29,16 @@ export class RecommendationHandler {
   static button(d: Recommendation, text: string, action: string) {
     return Markup.button.callback(text, `rec:${d.owner}:${d.id}:${action}:${d.revision}`);
   }
-  static async menu(ctx: Context, d?: Recommendation) {
+  static async menu(ctx: Context, d?: Recommendation, sessions?: Map<number, UserSession>) {
     if (!d?.active) {
-      await ctx.reply('⭐ 推荐推送未开启。普通发布不受影响。\n请先在发布模式选择目标，再新建一期推荐。', Markup.inlineKeyboard([
+      const session = sessions?.get(ctx.from!.id) || await database.getUserSession(ctx.from!.id);
+      const selected = session?.mode === 'publish' ? (session.selectedChannels?.length ? session.selectedChannels : session.selectedChannel ? [session.selectedChannel] : []) : [];
+      const allowed = selected.length ? await this.allowed(ctx) : [];
+      const targets = selected.length ? await Promise.all(selected.map(id => ctx.telegram.getChat(id))) : [];
+      const valid = targets.filter(c => allowed.some(a => a.id === String(c.id)));
+      await ctx.reply('⭐ 推荐推送未开启。普通发布不受影响。\n' + (valid.length === selected.length && valid.length
+        ? `已选择 ${valid.length} 个目标：\n${valid.map(c => 'title' in c ? c.title : String(c.id)).join('\n')}\n点击“新建一期推荐”开始填写文案。`
+        : '请先在发布模式选择目标，再新建一期推荐。'), Markup.inlineKeyboard([
         [Markup.button.callback('⭐ 新建一期推荐', 'recommend_new')],
         [Markup.button.callback('⬅️ 返回发布模式', 'start_publish')]
       ])); return;
@@ -40,13 +47,23 @@ export class RecommendationHandler {
       const ready = d.keywords.filter(k => d.links[c.id]?.[k]?.length).length;
       return `${c.title}：${ready}/${d.keywords.length} 个关键词已发布${d.posts[c.id]?.messageId ? ' · 已有推荐消息' : ''}`;
     }).join('\n');
-    await ctx.reply(`⭐ 本期推荐\n${status.slice(0, 1000)}\n\n文案：${d.caption ? d.caption.slice(0, 800) + (d.caption.length > 800 ? '…（预览可查看全文）' : '') : '待填写'}\n\n推荐关键词：${d.keywords.join('、').slice(0, 1200) || '待添加'}\n\n追加关键词不会清空已有内容。只关联本期开启后成功发布的资料。`, Markup.inlineKeyboard([
+    await ctx.reply(`⭐ 本期推荐\n${status.slice(0, 1000)}\n\n${d.caption ? '文案和关键词按钮见下方草稿预览。' : '文案待填写。'}\n追加关键词不会清空已有内容。待发布按钮仅供预览，资料发布成功后会关联跳转链接。`, Markup.inlineKeyboard([
       [this.button(d, '✏️ 修改文案', 'caption'), this.button(d, '➕ 添加关键词', 'add')],
       [this.button(d, '➖ 移除关键词', 'remove')],
       [this.button(d, '👀 预览并推送／更新', 'preview')],
       [this.button(d, '📢 继续普通发布', 'continue')],
       [this.button(d, '结束本期推荐', 'end')]
     ]));
+    if (d.caption && d.keywords.length) await this.showPreview(ctx, d);
+    else if (d.caption) await ctx.reply(d.caption, { entities: d.entities || [] });
+  }
+  static async showPreview(ctx: Context, d: Recommendation) {
+    const previews = d.channels.map(c => ({ c, body: recommendations.render(d, c.id, true) }));
+    for (const { c, body } of previews) {
+      await ctx.reply(`「${c.title}」草稿预览${body.missing.length ? '：带“待发布”的按钮尚无资料链接' : ''}`);
+      await ctx.reply(body.text, { entities: body.entities, reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } } as any);
+    }
+    return previews.some(p => p.body.missing.length);
   }
   static async action(ctx: Context, sessions: Map<number, UserSession>) {
     const uid = ctx.from!.id;
@@ -57,10 +74,10 @@ export class RecommendationHandler {
       if (recommendations.busy.has(uid)) throw new Error('正在推送，请稍候。');
       const data = (ctx.callbackQuery as any).data;
       let d = recommendations.get(uid);
-      if (data === 'recommend_menu') { recommendations.clearInput(uid); await this.menu(ctx, d); return; }
+      if (data === 'recommend_menu') { recommendations.clearInput(uid); await this.menu(ctx, d, sessions); return; }
       if (data === 'recommend_new') {
         if (d?.active) { await this.menu(ctx, d); return; }
-        const session = sessions.get(uid);
+        const session = sessions.get(uid) || await database.getUserSession(uid);
         const selected = session?.selectedChannels?.length ? session.selectedChannels : session?.selectedChannel ? [session.selectedChannel] : [];
         if (session?.mode !== 'publish' || !selected.length) throw new Error('请先在发布模式选择并确认目标频道。');
         delete (session as any).scheduleStage;
@@ -72,6 +89,7 @@ export class RecommendationHandler {
       }
       const [, owner, id, action, rev] = data.split(':');
       if (Number(owner) !== uid || !d?.active || d.id !== id) throw new Error('这不是你的当前推荐，请重新打开推荐菜单。');
+      if (action === 'pending') { await ctx.reply('这组资料还没有在本期发布到该目标。正常发布成功后，重新打开推荐菜单就能看到跳转按钮。'); return; }
       if (['caption', 'add', 'remove'].includes(action)) {
         d.input = action; recommendations.save();
         await ctx.reply(action === 'caption' ? '请输入新的推荐文案（最多 3500 字）。' : '请输入关键词，一行一个，或用空格、逗号分隔。', Markup.inlineKeyboard([[Markup.button.callback('取消输入／返回推荐', 'recommend_menu')]])); return;
@@ -103,12 +121,9 @@ export class RecommendationHandler {
         recommendations.change(d);
       }
       if (action === 'preview') {
-        // Validate every target before showing a confirm button.
-        const previews = d.channels.map(c => ({ c, body: recommendations.render(d, c.id) }));
         const version = d.revision;
-        for (const { c, body } of previews) {
-          await ctx.reply(`以下为「${c.title}」的推荐预览：`);
-          await ctx.reply(body.text, { reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } } as any);
+        if (await this.showPreview(ctx, d)) {
+          await ctx.reply('草稿可以提前查看。请先发布待发布的资料，或移除对应关键词，再确认推送。'); return;
         }
         await ctx.reply('确认后发送到本期目标；已推送过的频道会更新原消息。私有频道链接需要加入频道后才能查看。', Markup.inlineKeyboard([
           [Markup.button.callback('✅ 确认推送／更新', `rec:${uid}:${d.id}:push:${version}`)],
@@ -128,6 +143,7 @@ export class RecommendationHandler {
       if (d.input === 'caption') {
         if (!text.trim() || text.length > 3500) throw new Error('文案不能为空，最多 3500 字。');
         d.caption = text;
+        d.entities = ctx.message && 'entities' in ctx.message ? JSON.parse(JSON.stringify(ctx.message.entities || [])) : [];
         d.input = d.keywords.length ? undefined : 'keywords'; recommendations.change(d);
         if (d.input) { await ctx.reply('文案已保存。请输入特别推荐关键词，一行一个，或用空格、逗号分隔。'); return true; }
       } else {

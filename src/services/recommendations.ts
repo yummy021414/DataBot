@@ -3,10 +3,12 @@ import path from 'path';
 import { randomUUID } from 'crypto';
 import { config, isSuperAdmin } from '../config';
 import { MediaItem } from '../types';
+import { MessageEntity } from 'telegraf/types';
 
 export type Recommendation = {
   id: string; owner: number; active: boolean; revision: number;
   caption: string; keywords: string[]; channels: Array<{ id: string; title: string; username?: string }>;
+  entities?: MessageEntity[];
   input?: 'caption' | 'keywords' | 'add' | 'remove';
   links: Record<string, Record<string, Array<{ key: string; messageId: number }>>>;
   posts: Record<string, { messageId?: number; pending?: boolean; error?: string }>;
@@ -60,21 +62,23 @@ export class RecommendationStore {
       this.change(d);
     }
   }
-  render(d: Recommendation, channel: string) {
+  render(d: Recommendation, channel: string, preview = false) {
     if (!d.caption || !d.keywords.length) throw new Error('请先填写文案和推荐关键词。');
     const missing = d.keywords.filter(k => !Object.prototype.hasOwnProperty.call(d.links[channel] || {}, k) || !d.links[channel][k]?.length);
-    if (missing.length) throw new Error(`尚未在本期成功发布：${missing.join('、')}`);
+    if (missing.length && !preview) throw new Error(`尚未在本期成功发布：${missing.join('、')}`);
     if (!/^-100\d+$/.test(channel)) throw new Error('推荐链接仅支持频道或超级群。');
     const username = d.channels.find(c => c.id === channel)?.username;
     const prefix = username && /^\w+$/.test(username) ? username : `c/${channel.slice(4)}`;
-    const buttons = d.keywords.flatMap(keyword => d.links[channel][keyword].map((group, index, all) => ({
+    const buttons: any[] = d.keywords.flatMap<any>(keyword => missing.includes(keyword) ? [{
+      text: `${keyword} · 待发布`, callback_data: `rec:${d.owner}:${d.id}:pending:${d.revision}`
+    }] : d.links[channel][keyword].map((group, index, all) => ({
       text: `${keyword}${all.length > 1 ? ` · 第${index + 1}组` : ''}`,
       url: `https://t.me/${prefix}/${group.messageId}`
     })));
     if (buttons.length > 90) throw new Error('推荐资料超过 90 组，请移除部分关键词后再推送。');
     const rows = [];
     for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3));
-    return { text: d.caption, reply_markup: { inline_keyboard: rows } };
+    return { text: d.caption, entities: d.entities || [], missing, reply_markup: { inline_keyboard: rows } };
   }
   async push(d: Recommendation, revision: number, telegram: any) {
     if (!d.active || d.revision !== revision) throw new Error('推荐内容或资料链接已更新，请重新预览后确认。');
@@ -89,11 +93,11 @@ export class RecommendationStore {
         try {
           if (post.messageId) {
             await telegram.editMessageText(channel.id, post.messageId, undefined, body.text,
-              { reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } });
+              { entities: body.entities, reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } });
           } else {
             post.pending = true; this.save();
             const sent = await telegram.sendMessage(channel.id, body.text,
-              { reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } });
+              { entities: body.entities, reply_markup: body.reply_markup, link_preview_options: { is_disabled: true } });
             if (!sent?.message_id) throw new Error('未返回消息编号');
             post.messageId = sent.message_id;
           }

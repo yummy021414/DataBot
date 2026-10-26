@@ -706,14 +706,18 @@ export class TelegramBot {
     // 会员制度已取消，发布功能对所有用户开放
     // 设置用户为发布模式
     if (this.isAdmin(userId)) userAccountCommands.silentCleanup(userId);
+        const previous = this.userSessions.get(userId);
+        const selected = previous?.mode === BotMode.Publish ? this.getSelectedChannels(previous) : [];
         const session = {
       userId,
       mode: BotMode.Publish,
+      selectedChannels: selected,
+      selectedChannel: selected[0],
             step: 'selecting_channel' as const
     };
     this.userSessions.set(userId, session);
     await database.saveUserSession(userId, session);
-        await ctx.reply(`🚀 发布内容\n\n请选择一个或多个目标群/频道：`, await this.getChannelSelectionKeyboard(userId));
+        await ctx.reply(`🚀 发布内容\n\n请选择一个或多个目标群/频道：${selected.length ? '\n已保留之前的目标选择，请确认或调整。' : ''}`, await this.getChannelSelectionKeyboard(userId, selected));
   }
     async handleCheckMedia(ctx: Context) {
     const userId = ctx.from?.id;
