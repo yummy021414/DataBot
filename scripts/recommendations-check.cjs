@@ -13,40 +13,36 @@ const delivery = (keyword, id, owner = 1) => ({ items: [item(keyword, owner)], m
 (async () => {
   assert.deepEqual(Handler.parseKeywords('可可喜多多', ['可可', '喜多多']), ['可可', '喜多多']);
   const file = path.join(root, 'isolated.json'), store = new RecommendationStore(file);
-  store.record('-10011', [delivery('可可', 99)]);
-  const d = store.create(1, [channel('-10011')]);
-  d.caption = '推荐文案'; d.entities = [{ type: 'text_link', offset: 0, length: 2, url: 'https://t.me/example' }]; store.change(d);
+  // Publications can precede the caption and its link. Each button uses today's completed publication.
+  store.record('-10011', [delivery('可可', 10), delivery('喜多多', 11)]);
+  const d = store.create(1); d.channels = [channel('-10011')]; d.posts['-10011'] = { messageId: 100 };
+  d.keywords = ['可可', '喜多多']; store.change(d);
+  assert.equal(store.render(d, '-10011').reply_markup.inline_keyboard[0][0].url, 'https://t.me/c/11/10');
+  assert.equal(store.render(d, '-10011').reply_markup.inline_keyboard.flat().length, 2);
   const calls = [];
-  const tg = { sendMessage: async (id, text, extra) => { calls.push(['send', id, text, extra]); return { message_id: 100 }; },
-    editMessageReplyMarkup: async (id, messageId, _, markup) => calls.push(['edit', id, messageId, markup]) };
-  await store.sendCaption(d, tg);
-  assert.deepEqual(calls[0][3].entities, d.entities);
-  d.keywords = ['可可']; store.change(d);
-  assert.equal(store.render(d, '-10011', true).reply_markup.inline_keyboard[0][0].text, '可可 · 待发布');
-  store.record('-10011', [delivery('可可', 101), delivery('可可', 102)]);
-  assert.equal(store.render(d, '-10011').reply_markup.inline_keyboard[0][0].url, 'https://t.me/c/11/101');
+  const tg = { editMessageReplyMarkup: async (id, messageId, _, markup) => calls.push([id, messageId, markup]),
+    sendMessage: async () => { throw new Error('Must not send a new caption'); } };
   await store.push(d, d.revision, tg);
-  assert.deepEqual(calls.filter(c => c[0] === 'edit').map(c => c[2]), [100]);
-  assert.equal(calls.filter(c => c[0] === 'send').length, 1);
+  assert.deepEqual(calls.map(c => c[1]), [100]);
   await assert.rejects(store.push(d, d.revision - 1, tg), /重新预览/);
   const restored = new RecommendationStore(file);
-  assert.equal(restored.find(restored.get(1), '-10011', '可可'), 101);
-  d.active = false; store.change(d);
-  const next = store.create(1, [channel('-10011')], 'manual');
-  next.posts['-10011'] = { messageId: 120 }; next.keywords = ['可可']; store.change(next);
-  assert.equal(store.find(next, '-10011', '可可'), undefined);
-  store.record('-10011', [delivery('可可', 121, 2), delivery('可可', 122)]);
-  assert.equal(store.find(next, '-10011', '可可'), 122);
-  const uncertain = new RecommendationStore(path.join(root, 'unknown.json'));
-  const u = uncertain.create(1, [channel('-10011')]); u.caption = '文案'; let sends = 0;
-  const failing = { sendMessage: async () => { sends++; throw new Error('timeout'); } };
-  await uncertain.sendCaption(u, failing);
-  const restart = new RecommendationStore(path.join(root, 'unknown.json'));
-  await restart.sendCaption(restart.get(1), failing);
-  assert.equal(sends, 1);
+  assert.equal(restored.find(restored.get(1), '-10011', '可可'), 10);
+  store.record('-10011', [delivery('可可', 12)]);
+  assert.equal(store.find(d, '-10011', '可可'), 12, 'Latest successful run wins');
+  store.record('-10011', [delivery('可可', 13, 2)]);
+  assert.equal(store.find(d, '-10011', '可可'), 13, 'Superadmin can see all published material');
+  const admin = store.create(2); admin.channels = [channel('-10011')]; admin.posts['-10011'] = { messageId: 200 };
+  admin.keywords = ['可可']; store.change(admin);
+  assert.equal(store.find(admin, '-10011', '可可'), 13);
+  const yesterday = JSON.parse(fs.readFileSync(path.join(root, 'recommendation-publications.json'), 'utf8'));
+  yesterday.forEach(p => { p.at -= 86400000; });
+  fs.writeFileSync(path.join(root, 'recommendation-publications.json'), JSON.stringify(yesterday));
+  const old = new RecommendationStore(file);
+  assert.equal(old.find(old.get(1), '-10011', '可可'), undefined, 'Previous day must not appear');
+  assert.throws(() => old.render(old.get(1), '-10011'), /今天尚无/);
 
-  const integrated = recommendations.create(1, [channel('-10033')]);
-  integrated.posts['-10033'] = { messageId: 10 }; integrated.keywords = ['可可']; recommendations.change(integrated);
+  const integrated = recommendations.create(1);
+  integrated.channels = [channel('-10033')]; integrated.posts['-10033'] = { messageId: 100 }; integrated.keywords = ['可可']; recommendations.change(integrated);
   const queue = new PublicationQueue(path.join(root, 'paused.json'), { channel: 0, group: 0, globalPerMessage: 0, timeout: 1000 });
   let msg = 10;
   const transport = { getChat: async id => ({ id, type: 'channel' }), sendPhoto: async () => ({ message_id: ++msg }) };
@@ -58,34 +54,24 @@ const delivery = (keyword, id, owner = 1) => ({ items: [item(keyword, owner)], m
 
   database.getManagedChannels = async () => ['-10055']; database.getAllKeywords = async () => ['可可', '喜多多'];
   integrated.active = false; recommendations.change(integrated);
-  const replies = [], sessions = new Map([[1, { mode: 'publish', selectedChannels: ['-10055'] }]]);
+  const replies = [], sessions = new Map();
   const ctx = { from: { id: 1 }, chat: { id: 1, type: 'private' },
     telegram: { ...tg, getChat: async id => ({ id: Number(id), title: String(id), type: 'channel' }) },
     answerCbQuery: async () => {}, reply: async (text, extra) => replies.push({ text, extra }) };
   const action = async data => { ctx.callbackQuery = { data }; await Handler.action(ctx, sessions); };
-  await action('recommend_new'); const wizard = recommendations.get(1);
-  ctx.message = { text: '😀自定义推荐文案', entities: [{ type: 'text_link', offset: 2, length: 3, url: 'https://t.me/example' }] };
-  await Handler.input(ctx, ctx.message.text, sessions);
-  assert.equal(wizard.posts['-10055'].messageId, 100);
-  assert.equal(wizard.input, undefined);
-  assert.deepEqual(wizard.entities, ctx.message.entities);
-  await action(`rec:1:${wizard.id}:continue:${wizard.revision}`);
-  recommendations.record('-10055', [delivery('可可', 101), delivery('喜多多', 102)]);
-  await action(`rec:1:${wizard.id}:keywords:${wizard.revision}`);
-  await Handler.input(ctx, '可可喜多多', sessions);
-  assert.deepEqual(wizard.keywords, ['可可', '喜多多']);
-  await action(`rec:1:${wizard.id}:preview:${wizard.revision}`);
-  const confirmation = replies.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data;
-  await action(confirmation);
-  assert.equal(calls.filter(c => c[0] === 'edit').at(-1)[2], 100);
-  await action(`rec:1:${wizard.id}:end_confirm:${wizard.revision}`);
   await action('recommend_link'); const manual = recommendations.get(1);
+  await assert.rejects(recommendations.push(manual, manual.revision, tg), /绑定原文案/);
   await Handler.input(ctx, 'https://t.me/c/55/300', sessions);
   assert.equal(manual.posts['-10055'].messageId, 300);
-  recommendations.record('-10055', [delivery('可可', 301)]);
+  recommendations.record('-10055', [delivery('可可', 101), delivery('喜多多', 102)]);
   await action(`rec:1:${manual.id}:keywords:${manual.revision}`);
-  await Handler.input(ctx, '可可', sessions);
+  await Handler.input(ctx, '可可喜多多', sessions);
+  assert.deepEqual(manual.keywords, ['可可', '喜多多']);
+  await action(`rec:1:${manual.id}:preview:${manual.revision}`);
+  const confirmation = replies.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data;
+  await action(confirmation);
+  assert.equal(calls.at(-1)[1], 300);
   assert.match(await recommendations.push(manual, manual.revision,
     { editMessageReplyMarkup: async () => { throw new Error('message can not be edited'); } }), /无法编辑原消息/);
-  console.log('PASS: caption first, later publication lookup, original markup edit, restart, failed run, wizard and manual link');
+  console.log('PASS: manual link, same-day publication lookup regardless of message order, one button per keyword, edit only, restart, failed run and permissions');
 })().catch(e => { console.error(e); process.exitCode = 1; });

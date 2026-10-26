@@ -198,7 +198,7 @@ export class TelegramBot {
           (text && (text.startsWith('/') || (Object.values(BUTTONS) as string[]).includes(text))))) recommendations.clearInput(ctx.from.id);
       return next();
     });
-    this.bot.action(/^recommend_(menu|new|link)$|^rec:/, this.withStrictAuthorization(ctx => RecommendationHandler.action(ctx, this.userSessions)));
+    this.bot.action(/^recommend_(menu|link)$|^rec:/, this.withStrictAuthorization(ctx => RecommendationHandler.action(ctx, this.userSessions)));
     this.bot.command('recommend_bind', this.withStrictAuthorization(ctx => RecommendationHandler.bind(ctx)));
     this.bot.start(this.withAuthorization(this.handleStart.bind(this)));
     this.bot.help(this.withAuthorization(this.handleHelp.bind(this)));
