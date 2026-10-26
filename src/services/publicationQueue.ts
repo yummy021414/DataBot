@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { config } from '../config';
 import { MediaItem } from '../types';
+import { recommendations, Delivery } from './recommendations';
 
 export type PublishSender = (items: MediaItem[]) => Promise<any[]>;
 const wait = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, Math.max(0, ms)));
@@ -90,13 +91,18 @@ export class PublicationQueue {
     this.tails.set(chat.id, tail);
     await previous;
     let completed = 0;
+    const editions = recommendations.capture(chat.id);
+    const deliveries: Delivery[] = [];
     try {
       this.assertReady(chat.id);
-      return await work(async items => {
+      const value = await work(async items => {
         const result = await this.send(telegram, chat, items);
         completed += items.length;
+        if (editions.length) deliveries.push({ items, messages: result });
         return result;
       });
+      if (deliveries.length) recommendations.record(chat.id, editions, deliveries);
+      return value;
     } catch (error: any) {
       if (completed && !this.blocked[chat.id]) {
         this.pause(chat.id, '发布中途失败，已有部分资料发出');

@@ -6,6 +6,8 @@ import { database } from '../database';
 import { SearchHandler } from './handlers/SearchHandler';
 import { ReplaceGroupHandler } from './handlers/ReplaceGroupHandler';
 import { RecentSearchHandler } from './handlers/RecentSearchHandler';
+import { RecommendationHandler } from './handlers/RecommendationHandler';
+import { recommendations } from '../services/recommendations';
 import { publicationQueue } from '../services/publicationQueue';
 import { UploadHandler } from './handlers/UploadHandler';
 import { PublishHandler } from './handlers/PublishHandler';
@@ -189,6 +191,15 @@ export class TelegramBot {
       return next();
     });
     // 基础命令
+    this.bot.use(async (ctx, next) => {
+      const action = (ctx.callbackQuery as any)?.data;
+      const text = ctx.message && 'text' in ctx.message ? ctx.message.text : '';
+      if (ctx.from && ((action && !action.startsWith('rec:') && !action.startsWith('recommend_')) ||
+          (text && (text.startsWith('/') || (Object.values(BUTTONS) as string[]).includes(text))))) recommendations.clearInput(ctx.from.id);
+      return next();
+    });
+    this.bot.action(/^recommend_(menu|new)$|^rec:/, this.withStrictAuthorization(ctx => RecommendationHandler.action(ctx, this.userSessions)));
+    this.bot.command('recommend_bind', this.withStrictAuthorization(ctx => RecommendationHandler.bind(ctx)));
     this.bot.start(this.withAuthorization(this.handleStart.bind(this)));
     this.bot.help(this.withAuthorization(this.handleHelp.bind(this)));
     this.bot.command('admin', this.withAuthorization(this.handleAdmin.bind(this)));
@@ -1368,7 +1379,7 @@ export class TelegramBot {
         `• 或多个空格：优米 樊樊 北北\n` +
         `会按顺序同步发到所有已选目标。\n\n` +
         `🔄 发布模式将保持激活，可连续发布`, Markup.inlineKeyboard([
-          ...(isAdminUser(userId) ? [[Markup.button.callback('⏰ 定时发送', 'schedule_begin'), Markup.button.callback('📋 定时任务', 'schedule_list')], [Markup.button.callback('立即发送', 'schedule_immediate')]] : []),
+          ...(isAdminUser(userId) ? [[Markup.button.callback('⏰ 定时发送', 'schedule_begin'), Markup.button.callback('📋 定时任务', 'schedule_list')], [Markup.button.callback('⭐ 推荐推送', 'recommend_menu')], [Markup.button.callback('立即发送', 'schedule_immediate')]] : []),
           [Markup.button.callback('❌ 退出发布模式', 'cancel')]
         ])).catch(async () => {
           await ctx.reply('✅ 目标已确认，请直接输入要发布的关键词。');
@@ -1549,6 +1560,7 @@ export class TelegramBot {
 
         const text = ctx.message && 'text' in ctx.message ? ctx.message.text : undefined;
         if (!text) return;
+        if (await RecommendationHandler.input(ctx, text, this.userSessions)) return;
         if (await WatermarkHandler.handleKeywordInput(ctx, database)) return;
 
         // 🚀 增加全量日志，确保能看到每一条进来的消息
@@ -2443,6 +2455,7 @@ export class TelegramBot {
           buttons.push([Markup.button.callback(`✅ 确认 ${selected.size} 个目标`, 'publish_channels_confirm')]);
         }
         if (isAdminUser(userId)) buttons.push([Markup.button.callback('📋 定时任务', 'schedule_list')]);
+        if (isAdminUser(userId)) buttons.push([Markup.button.callback('⭐ 推荐推送', 'recommend_menu')]);
         buttons.push([Markup.button.callback(BUTTONS.BACK_TO_MAIN, 'back_to_main')]);
         return Markup.inlineKeyboard(buttons);
   }
