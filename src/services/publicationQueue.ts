@@ -91,17 +91,16 @@ export class PublicationQueue {
     this.tails.set(chat.id, tail);
     await previous;
     let completed = 0;
-    const editions = recommendations.capture(chat.id);
     const deliveries: Delivery[] = [];
     try {
       this.assertReady(chat.id);
       const value = await work(async items => {
         const result = await this.send(telegram, chat, items);
         completed += items.length;
-        if (editions.length) deliveries.push({ items, messages: result });
+        deliveries.push({ items, messages: result });
         return result;
       });
-      if (deliveries.length) recommendations.record(chat.id, editions, deliveries);
+      if (deliveries.length) recommendations.record(chat.id, deliveries);
       return value;
     } catch (error: any) {
       if (completed && !this.blocked[chat.id]) {
