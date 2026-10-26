@@ -71,8 +71,8 @@ export class RecommendationStore {
     const prefix = username && /^\w+$/.test(username) ? username : `c/${channel.slice(4)}`;
     const buttons: any[] = d.keywords.flatMap<any>(keyword => missing.includes(keyword) ? [{
       text: `${keyword} · 待发布`, callback_data: `rec:${d.owner}:${d.id}:pending:${d.revision}`
-    }] : d.links[channel][keyword].map((group, index, all) => ({
-      text: `${keyword}${all.length > 1 ? ` · 第${index + 1}组` : ''}`,
+    }] : d.links[channel][keyword].slice(0, 1).map(group => ({
+      text: keyword,
       url: `https://t.me/${prefix}/${group.messageId}`
     })));
     if (buttons.length > 90) throw new Error('推荐资料超过 90 组，请移除部分关键词后再推送。');

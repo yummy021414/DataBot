@@ -11,6 +11,11 @@ const channel = id => ({ id, title: '目标' + id });
 const item = (keyword, batchId = 'a', owner = 1) => ({ id: 1, keyword, batchId, uploaded_by: owner, file_id: keyword, file_type: 'photo' });
 const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keyword, batch, owner)], messages: [{ message_id: id }] });
 (async () => {
+  const known = ['一宸', '车厘子', 'kk', '月月', '鹿鹿', '张张'];
+  assert.deepEqual(Handler.parseKeywords('一宸 车厘子 kk月月鹿鹿张张', known), known);
+  assert.deepEqual(Handler.parseKeywords('kk月月，鹿鹿\n张张 kk', known), ['kk', '月月', '鹿鹿', '张张']);
+  assert.deepEqual(Handler.parseKeywords('kk未知名字', known), ['kk未知名字']);
+  assert.deepEqual(Handler.parseKeywords('kk月月kk', known), ['kk', '月月']);
   const file = path.join(root, 'isolated.json'), store = new RecommendationStore(file);
   assert.deepEqual(store.capture('-10011'), []);
   const d = store.create(1, [channel('-10011'), channel('-10022')]);
@@ -20,7 +25,7 @@ const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keywor
   assert.equal(store.render(d, '-10011', true).reply_markup.inline_keyboard[0][0].text, '可可 · 待发布');
   store.record('-10011', store.capture('-10011'), [delivery('可可', 11), delivery('可可', 12), delivery('可可', 15, 'b'), delivery('喜多多', 20)]);
   store.record('-10022', store.capture('-10022'), [delivery('可可', 91)]);
-  assert.deepEqual(store.render(d, '-10011').reply_markup.inline_keyboard.flat().map(b => b.url), ['https://t.me/c/11/11', 'https://t.me/c/11/15']);
+  assert.deepEqual(store.render(d, '-10011').reply_markup.inline_keyboard.flat().map(b => b.url), ['https://t.me/c/11/11']);
   assert.equal(store.render(d, '-10022').reply_markup.inline_keyboard[0][0].url, 'https://t.me/c/22/91');
   d.channels[1].username = 'public_channel';
   assert.equal(store.render(d, '-10022').reply_markup.inline_keyboard[0][0].url, 'https://t.me/public_channel/91');
@@ -82,6 +87,9 @@ const delivery = (keyword, id, batch = 'a', owner = 1) => ({ items: [item(keywor
   await Handler.input(ctx, ctx.message.text, sessions); assert.equal(wizard.input, 'keywords');
   assert.deepEqual(wizard.entities, ctx.message.entities);
   await Handler.input(ctx, '可可 可可', sessions); assert.deepEqual(wizard.keywords, ['可可']); assert(!wizard.input);
+  wizard.keywords = ['可可喜多多', '可可']; recommendations.change(wizard);
+  await action('recommend_menu'); assert.deepEqual(wizard.keywords, ['可可', '喜多多']);
+  wizard.keywords = ['可可']; recommendations.change(wizard);
   assert.deepEqual(replies.at(-1).extra.entities, ctx.message.entities);
   assert.equal(replies.at(-1).extra.reply_markup.inline_keyboard[0][0].text, '可可 · 待发布');
   await action(`rec:1:${wizard.id}:add:0`); await Handler.input(ctx, '喜多多 可可', sessions);

@@ -1,10 +1,30 @@
 import { Context, Markup } from 'telegraf';
 import { database } from '../../database';
 import { UserSession, BotMode } from '../../types';
-import { getAdminChannelIds, hasAdminChannelMap, isAdminUser } from '../../config';
+import { getAdminChannelIds, hasAdminChannelMap, isAdminUser, isSuperAdmin } from '../../config';
 import { recommendations, Recommendation } from '../../services/recommendations';
 
 export class RecommendationHandler {
+  static parseKeywords(text: string, known: string[]): string[] {
+    if (known.includes(text.trim())) return [text.trim()];
+    const sorted = known.filter(Boolean).sort((a, b) => b.length - a.length || a.localeCompare(b));
+    return [...new Set(text.split(/[\s,，、|／/]+/).filter(Boolean).flatMap(part => {
+      const matches: string[] = [];
+      for (let offset = 0; offset < part.length;) {
+        const hit = sorted.find(k => part.startsWith(k, offset));
+        if (!hit) return [part]; // Preserve unknown names rather than silently dropping characters.
+        matches.push(hit); offset += hit.length;
+      }
+      return matches;
+    }))];
+  }
+  static async normalize(d: Recommendation) {
+    const known = await database.getAllKeywords(isSuperAdmin(d.owner) ? undefined : d.owner);
+    const values = [...new Set(d.keywords.flatMap(k => this.parseKeywords(k, known)))];
+    if (values.length <= 60 && JSON.stringify(values) !== JSON.stringify(d.keywords)) {
+      d.keywords = values; recommendations.change(d);
+    }
+  }
   static async bind(ctx: Context) {
     try {
       const uid = ctx.from!.id, d = recommendations.get(uid);
@@ -30,6 +50,7 @@ export class RecommendationHandler {
     return Markup.button.callback(text, `rec:${d.owner}:${d.id}:${action}:${d.revision}`);
   }
   static async menu(ctx: Context, d?: Recommendation, sessions?: Map<number, UserSession>) {
+    if (d?.active) await this.normalize(d);
     if (!d?.active) {
       const session = sessions?.get(ctx.from!.id) || await database.getUserSession(ctx.from!.id);
       const selected = session?.mode === 'publish' ? (session.selectedChannels?.length ? session.selectedChannels : session.selectedChannel ? [session.selectedChannel] : []) : [];
@@ -89,10 +110,11 @@ export class RecommendationHandler {
       }
       const [, owner, id, action, rev] = data.split(':');
       if (Number(owner) !== uid || !d?.active || d.id !== id) throw new Error('这不是你的当前推荐，请重新打开推荐菜单。');
+      await this.normalize(d);
       if (action === 'pending') { await ctx.reply('这组资料还没有在本期发布到该目标。正常发布成功后，重新打开推荐菜单就能看到跳转按钮。'); return; }
       if (['caption', 'add', 'remove'].includes(action)) {
         d.input = action; recommendations.save();
-        await ctx.reply(action === 'caption' ? '请输入新的推荐文案（最多 3500 字）。' : '请输入关键词，一行一个，或用空格、逗号分隔。', Markup.inlineKeyboard([[Markup.button.callback('取消输入／返回推荐', 'recommend_menu')]])); return;
+        await ctx.reply(action === 'caption' ? '请输入新的推荐文案（最多 3500 字）。' : '请输入推荐关键词，支持连写、空格、换行或逗号分隔；连写按资料库关键词识别。', Markup.inlineKeyboard([[Markup.button.callback('取消输入／返回推荐', 'recommend_menu')]])); return;
       }
       recommendations.clearInput(uid);
       if (action === 'continue') {
@@ -145,10 +167,10 @@ export class RecommendationHandler {
         d.caption = text;
         d.entities = ctx.message && 'entities' in ctx.message ? JSON.parse(JSON.stringify(ctx.message.entities || [])) : [];
         d.input = d.keywords.length ? undefined : 'keywords'; recommendations.change(d);
-        if (d.input) { await ctx.reply('文案已保存。请输入特别推荐关键词，一行一个，或用空格、逗号分隔。'); return true; }
+        if (d.input) { await ctx.reply('文案已保存。请输入特别推荐关键词，支持连写、空格、换行或逗号分隔；连写按资料库关键词识别。'); return true; }
       } else {
-        const known = await database.getAllKeywords();
-        const values = text.split(/[\n,，、]+/).flatMap(part => known.includes(part.trim()) ? [part.trim()] : part.trim().split(/\s+/)).filter(Boolean);
+        const known = await database.getAllKeywords(isSuperAdmin(uid) ? undefined : uid);
+        const values = this.parseKeywords(text, known);
         const next = d.input === 'remove' ? d.keywords.filter(k => !values.includes(k)) : [...new Set([...d.keywords, ...values])];
         if (!values.length || next.length > 60) throw new Error('请输入关键词，每期最多 60 个推荐关键词。');
         d.keywords = next; delete d.input; recommendations.change(d);
